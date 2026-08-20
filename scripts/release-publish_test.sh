@@ -62,6 +62,7 @@ end
 
 HOST_SHA256SUM = resolve_host_executable("sha256sum", ENV.fetch("PATH"), Dir.pwd)
 raise "host sha256sum is unavailable" unless HOST_SHA256SUM
+HOST_GOCACHE = File.join(Dir.tmpdir, "agent-studio-node-index-go-cache")
 
 FAKE_GH = <<~'FAKE_GH_RUBY'
   #!/usr/bin/env ruby
@@ -474,7 +475,7 @@ def setup_fixture(directory, fake_gh = FAKE_GH)
     "REMOTE_MAIN_COMMIT" => REMOTE_MAIN_COMMIT,
     "REAL_SHA256SUM" => HOST_SHA256SUM,
     "CGO_ENABLED" => "0",
-    "GOCACHE" => "/private/tmp/agent-studio-node-index-go-cache",
+    "GOCACHE" => HOST_GOCACHE,
   }
 end
 
@@ -543,6 +544,15 @@ Dir.mktmpdir("host-tool-resolution") do |directory|
   assert.call(
     resolve_host_executable("fixture-tool", ":/not-present", directory) == tool,
     "host tool resolver did not interpret an empty PATH entry as the initial directory",
+  )
+end
+
+Dir.mktmpdir("go-cache-location") do |directory|
+  environment = setup_fixture(directory)
+  temp_root = "#{File.expand_path(Dir.tmpdir)}#{File::SEPARATOR}"
+  assert.call(
+    File.expand_path(environment.fetch("GOCACHE")).start_with?(temp_root),
+    "release fixture Go cache escaped the host temporary directory",
   )
 end
 
