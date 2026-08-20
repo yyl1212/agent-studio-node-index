@@ -37,6 +37,10 @@ def validate(workflow, raw_workflow)
   assert.call(workflow.fetch("on", nil) == {"push" => {"tags" => ["v*"]}}, "release trigger must be tag-only v*")
   assert.call(!raw_workflow.include?("pull_request_target"), "release workflow must not use pull_request_target")
   assert.call(workflow.fetch("permissions", nil) == {"contents" => "read"}, "global permissions must be contents: read")
+  assert.call(workflow.fetch("concurrency", nil) == {
+    "group" => "agent-studio-node-index-release",
+    "cancel-in-progress" => false,
+  }, "release workflow must use one fixed non-cancelling concurrency group")
 
   jobs = workflow.fetch("jobs", {})
   assert.call(jobs.keys == ["build", "publish"], "release workflow must contain only build and publish jobs")
@@ -70,11 +74,8 @@ def validate(workflow, raw_workflow)
     "Checkout release tag",
     "Setup Go 1.26.5",
     "Download verified release assets",
-    "Revalidate release assets",
-    "Create draft and upload exact assets",
-    "Download draft and compare bytes",
-    "Promote immutable stable release",
-    "Verify immutable release",
+    "Regenerate expected release assets",
+    "Publish verified immutable release",
   ]
   assert.call(build_steps.map { |step| step.fetch("name", "") } == required_build_steps, "build step order changed")
   assert.call(publish_steps.map { |step| step.fetch("name", "") } == required_publish_steps, "publish ordering may allow publication before validation")
@@ -135,7 +136,7 @@ def validate(workflow, raw_workflow)
   assert.call(download.fetch("uses", nil) == "actions/download-artifact@#{DOWNLOAD_ARTIFACT_SHA}", "download-artifact Action SHA changed")
   assert.call(download.dig("with", "path") == "dist", "artifact download path changed")
 
-  revalidate_step = publish_by_name.fetch("Revalidate release assets")
+  revalidate_step = publish_by_name.fetch("Regenerate expected release assets")
   revalidate_run = revalidate_step.fetch("run", "")
   assert.call(!revalidate_step.key?("env"), "write token must not be exposed to indexgen during publish revalidation")
   [
@@ -144,51 +145,23 @@ def validate(workflow, raw_workflow)
     "CGO_ENABLED=0 go run ./cmd/indexgen",
     "-out expected",
     "cmp --silent",
-    "a Release appeared before publication",
-    'GITHUB_TOKEN="${{ github.token }}" gh api --include',
   ].each do |fragment|
     assert.call(revalidate_run.include?(fragment), "publish revalidation missing: #{fragment}")
   end
   assert.call(revalidate_run.include?('[[ "$source_commit" != "$tag_commit" ]]'), "downloaded index source must match the Tag commit")
 
-  create_run = publish_by_name.fetch("Create draft and upload exact assets").fetch("run", "")
-  assert.call(create_run.include?("gh release create") && create_run.include?("--draft"), "release must be created as draft")
-  upload_lines = create_run.lines.drop_while { |line| !line.lstrip.start_with?("gh release upload ") }
-  upload_command = upload_lines.take_while.with_index { |line, index| index == 0 || upload_lines[index - 1].rstrip.end_with?("\\") }.join.gsub(/\\\s*\n/, " ")
-  upload_arguments = Shellwords.shellsplit(upload_command)
-  assert.call(upload_arguments == [
-    "gh",
-    "release",
-    "upload",
-    "$GITHUB_REF_NAME",
-    "dist/checksums.txt",
-    "dist/index.json",
-    "dist/node-index-v1alpha1.schema.json",
-  ], "draft upload must name exactly three assets")
-  assert.call(create_run.include?("assert_api_assets"), "draft API assets must be verified before promotion")
+  publish_step = publish_by_name.fetch("Publish verified immutable release")
+  assert.call(publish_step.fetch("env", nil) == {
+    "GITHUB_TOKEN" => "${{ github.token }}",
+    "RELEASE_DIST_DIR" => "dist",
+    "RELEASE_EXPECTED_DIR" => "expected",
+  }, "publish state machine environment changed")
+  publish_run = publish_step.fetch("run", "")
+  assert.call(publish_run == "bash scripts/release-publish.sh\n", "publish job must execute the tested Release state machine")
   assert.call(!build_steps.any? { |step| step.fetch("run", "").match?(/gh release (create|upload|edit)/) }, "build job must not publish")
-  revalidate_index = publish_steps.index(publish_by_name.fetch("Revalidate release assets"))
-  create_index = publish_steps.index(publish_by_name.fetch("Create draft and upload exact assets"))
-  assert.call(revalidate_index && create_index && revalidate_index < create_index, "publication starts before asset validation")
-
-  compare_run = publish_by_name.fetch("Download draft and compare bytes").fetch("run", "")
-  assert.call(compare_run.include?("gh release download") && compare_run.include?("assert_exact_assets") && compare_run.include?("cmp --silent"), "draft assets must be downloaded and byte-compared")
-
-  promote_run = publish_by_name.fetch("Promote immutable stable release").fetch("run", "")
-  assert.call(promote_run.include?("gh release edit") && promote_run.include?("--draft=false") && promote_run.include?("--prerelease=false") && promote_run.include?("--latest"), "final promotion flags changed")
-
-  verify_run = publish_by_name.fetch("Verify immutable release").fetch("run", "")
-  [
-    "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME",
-    "X-GitHub-Api-Version: 2026-03-10",
-    "[.draft,.prerelease,.immutable,.tag_name] | @tsv",
-    "false\\tfalse\\ttrue\\t${GITHUB_REF_NAME}",
-    "deadline=$((SECONDS + 60))",
-    "assert_api_assets",
-    "sha256:",
-  ].each do |fragment|
-    assert.call(verify_run.include?(fragment), "immutable Release poll missing: #{fragment}")
-  end
+  revalidate_index = publish_steps.index(publish_by_name.fetch("Regenerate expected release assets"))
+  publish_index = publish_steps.index(publish_by_name.fetch("Publish verified immutable release"))
+  assert.call(revalidate_index && publish_index && revalidate_index < publish_index, "publication starts before deterministic regeneration")
 
   failures
 end
@@ -262,43 +235,6 @@ Dir.mktmpdir("release-workflow-assets") do |directory|
   abort "exact asset checker accepted a symbolic-link asset" if run_checker.call
 end
 
-verify_run = workflow.fetch("jobs").fetch("publish").fetch("steps")[7].fetch("run")
-api_asset_checker = verify_run[/(assert_api_assets\(\) \{.*?\n\})\n\nrelease_json/m, 1]
-abort "unable to extract the API asset checker" unless api_asset_checker
-
-Dir.mktmpdir("release-workflow-api-assets") do |directory|
-  dist = File.join(directory, "dist")
-  Dir.mkdir(dist)
-  expected_names = ["checksums.txt", "index.json", "node-index-v1alpha1.schema.json"]
-  expected_names.each { |name| File.write(File.join(dist, name), "#{name}\n") }
-  valid_assets = expected_names.map do |name|
-    path = File.join(dist, name)
-    {
-      "name" => name,
-      "size" => File.size(path),
-      "digest" => "sha256:#{Digest::SHA256.file(path).hexdigest}",
-    }
-  end
-  release_json = File.join(directory, "release.json")
-  run_checker = lambda do |assets|
-    File.write(release_json, JSON.generate({"assets" => assets}))
-    Open3.capture3(
-      "bash", "-c", "#{api_asset_checker}\nassert_api_assets \"$1\"", "api-asset-checker", release_json,
-      chdir: directory,
-    ).last.success?
-  end
-
-  abort "API asset checker rejected the valid fixture" unless run_checker.call(valid_assets)
-  mismatched = Marshal.load(Marshal.dump(valid_assets))
-  mismatched[1]["digest"] = "sha256:#{'0' * 64}"
-  abort "API asset checker accepted a checksum mismatch" if run_checker.call(mismatched)
-  extra = Marshal.load(Marshal.dump(valid_assets)) + [{"name" => "unexpected.json", "size" => 1, "digest" => "sha256:#{'0' * 64}"}]
-  abort "API asset checker accepted an unexpected asset" if run_checker.call(extra)
-  empty = Marshal.load(Marshal.dump(valid_assets))
-  empty[0]["size"] = 0
-  abort "API asset checker accepted an empty asset" if run_checker.call(empty)
-end
-
 def deep_copy(value)
   Marshal.load(Marshal.dump(value))
 end
@@ -310,17 +246,10 @@ mutations = {
   "mutable Action ref" => ->(copy) { copy["jobs"]["build"]["steps"][0]["uses"] = "actions/checkout@v6" },
   "shallow checkout" => ->(copy) { copy["jobs"]["build"]["steps"][0]["with"]["fetch-depth"] = 1 },
   "reused Tag accepted" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!(".created == true", ".created == false") },
-  "existing Release accepted" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("a Release already exists for $GITHUB_REF_NAME", "Release reuse allowed") },
   "missing SemVer ordering" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("semver.Compare(previous, current) >= 0", "false") },
   "missing ancestor check" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("git merge-base --is-ancestor", "git merge-base") },
   "missing source commit check" => ->(copy) { copy["jobs"]["build"]["steps"][3]["run"].sub!('[[ "$source_commit" != "$tag_commit" ]]', "false") },
   "missing exact asset check" => ->(copy) { copy["jobs"]["publish"]["steps"][3]["run"].sub!("assert_exact_assets dist", ":") },
-  "unexpected uploaded asset" => ->(copy) do
-    run = copy["jobs"]["publish"]["steps"][4]["run"]
-    run.sub!("  dist/node-index-v1alpha1.schema.json\n", '  dist/node-index-v1alpha1.schema.json \\' + "\n  dist/unexpected.json\n")
-  end,
-  "publish before validation" => ->(copy) { copy["jobs"]["publish"]["steps"][3], copy["jobs"]["publish"]["steps"][4] = copy["jobs"]["publish"]["steps"][4], copy["jobs"]["publish"]["steps"][3] },
-  "missing immutable poll" => ->(copy) { copy["jobs"]["publish"]["steps"][7]["run"].sub!("false\\tfalse\\ttrue\\t${GITHUB_REF_NAME}", "false\\tfalse\\tfalse\\t${GITHUB_REF_NAME}") },
 }
 
 mutations.each do |name, mutate|
@@ -331,5 +260,7 @@ mutations.each do |name, mutate|
   end
 end
 RUBY
+
+sh "$script_dir/release-publish_test.sh"
 
 printf 'Release workflow contract tests passed\n'

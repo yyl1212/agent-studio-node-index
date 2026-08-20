@@ -8,6 +8,10 @@ name: Release
 permissions:
   contents: read
 
+concurrency:
+  group: agent-studio-node-index-release
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build verified release assets
@@ -209,7 +213,7 @@ jobs:
           name: release-assets
           path: dist
 
-      - name: Revalidate release assets
+      - name: Regenerate expected release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -251,19 +255,6 @@ jobs:
             exit 1
           fi
 
-          release_probe=$(mktemp "$RUNNER_TEMP/release-probe.XXXXXX")
-          trap 'rm -f "$release_probe"' EXIT
-          if GITHUB_TOKEN="${{ github.token }}" gh api --include \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            -H "X-GitHub-Api-Version: 2026-03-10" >"$release_probe" 2>&1; then
-            echo "a Release appeared before publication" >&2
-            exit 1
-          elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_probe"; then
-            cat "$release_probe" >&2
-            echo "unable to revalidate that the Release does not exist" >&2
-            exit 1
-          fi
-
           CGO_ENABLED=0 go run ./cmd/indexgen \
             -root . \
             -release "$GITHUB_REF_NAME" \
@@ -275,145 +266,11 @@ jobs:
             cmp --silent "dist/$name" "expected/$name"
           done
 
-      - name: Create draft and upload exact assets
+      - name: Publish verified immutable release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_DIST_DIR: dist
+          RELEASE_EXPECTED_DIR: expected
         run: |
-          set -euo pipefail
-
-          assert_api_assets() {
-            local release_json=$1
-            local checksums_digest index_digest schema_digest
-            checksums_digest="sha256:$(sha256sum dist/checksums.txt | awk '{print $1}')"
-            index_digest="sha256:$(sha256sum dist/index.json | awk '{print $1}')"
-            schema_digest="sha256:$(sha256sum dist/node-index-v1alpha1.schema.json | awk '{print $1}')"
-            jq -e \
-              --arg checksums_digest "$checksums_digest" \
-              --arg index_digest "$index_digest" \
-              --arg schema_digest "$schema_digest" \
-              '
-                (.assets | length) == 3 and
-                ([.assets[].name] | sort) == ["checksums.txt", "index.json", "node-index-v1alpha1.schema.json"] and
-                all(.assets[]; (.size | type) == "number" and .size > 0 and (.digest | type) == "string" and (.digest | startswith("sha256:"))) and
-                (first(.assets[] | select(.name == "checksums.txt")).digest == $checksums_digest) and
-                (first(.assets[] | select(.name == "index.json")).digest == $index_digest) and
-                (first(.assets[] | select(.name == "node-index-v1alpha1.schema.json")).digest == $schema_digest)
-              ' "$release_json" >/dev/null
-          }
-
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag \
-            --draft \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Agent Studio 官方精选节点包索引 $GITHUB_REF_NAME"
-          gh release upload "$GITHUB_REF_NAME" \
-            dist/checksums.txt \
-            dist/index.json \
-            dist/node-index-v1alpha1.schema.json
-
-          release_json=$(mktemp "$RUNNER_TEMP/draft-release.XXXXXX.json")
-          trap 'rm -f "$release_json"' EXIT
-          gh api \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            >"$release_json"
-          jq -e --arg tag "$GITHUB_REF_NAME" '.draft == true and .prerelease == false and .tag_name == $tag' "$release_json" >/dev/null
-          assert_api_assets "$release_json"
-
-      - name: Download draft and compare bytes
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          assert_exact_assets() {
-            local directory=$1
-            local expected actual name
-            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
-            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
-            if [[ "$actual" != "$expected" ]]; then
-              echo "unexpected downloaded draft asset set" >&2
-              return 1
-            fi
-            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
-              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
-                echo "downloaded draft asset must be a non-empty regular file: $name" >&2
-                return 1
-              fi
-            done
-          }
-
-          download_dir=$(mktemp -d "$RUNNER_TEMP/draft-assets.XXXXXX")
-          trap 'rm -rf "$download_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" \
-            --dir "$download_dir" \
-            --pattern checksums.txt \
-            --pattern index.json \
-            --pattern node-index-v1alpha1.schema.json
-          assert_exact_assets "$download_dir"
-          (cd "$download_dir" && sha256sum --check checksums.txt)
-          for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
-            cmp --silent "dist/$name" "$download_dir/$name"
-          done
-
-      - name: Promote immutable stable release
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest
-
-      - name: Verify immutable release
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          assert_api_assets() {
-            local release_json=$1
-            local checksums_digest index_digest schema_digest
-            checksums_digest="sha256:$(sha256sum dist/checksums.txt | awk '{print $1}')"
-            index_digest="sha256:$(sha256sum dist/index.json | awk '{print $1}')"
-            schema_digest="sha256:$(sha256sum dist/node-index-v1alpha1.schema.json | awk '{print $1}')"
-            jq -e \
-              --arg checksums_digest "$checksums_digest" \
-              --arg index_digest "$index_digest" \
-              --arg schema_digest "$schema_digest" \
-              '
-                (.assets | length) == 3 and
-                ([.assets[].name] | sort) == ["checksums.txt", "index.json", "node-index-v1alpha1.schema.json"] and
-                all(.assets[]; (.size | type) == "number" and .size > 0 and (.digest | type) == "string" and (.digest | startswith("sha256:"))) and
-                (first(.assets[] | select(.name == "checksums.txt")).digest == $checksums_digest) and
-                (first(.assets[] | select(.name == "index.json")).digest == $index_digest) and
-                (first(.assets[] | select(.name == "node-index-v1alpha1.schema.json")).digest == $schema_digest)
-              ' "$release_json" >/dev/null
-          }
-
-          release_json=$(mktemp "$RUNNER_TEMP/immutable-release.XXXXXX.json")
-          trap 'rm -f "$release_json"' EXIT
-          expected_state=$(printf "false\tfalse\ttrue\t${GITHUB_REF_NAME}")
-          deadline=$((SECONDS + 60))
-          while (( SECONDS <= deadline )); do
-            state=$(gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              --jq '[.draft,.prerelease,.immutable,.tag_name] | @tsv')
-            gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              >"$release_json"
-            if [[ "$state" == "$expected_state" ]] && assert_api_assets "$release_json"; then
-              exit 0
-            fi
-            if (( SECONDS >= deadline )); then
-              break
-            fi
-            sleep 2
-          done
-
-          echo "Release did not become immutable with the exact verified assets within 60 seconds" >&2
-          exit 1
+          bash scripts/release-publish.sh
