@@ -24,6 +24,13 @@ type Submission struct {
 	Manifest   NodePackageManifest `json:"manifest"`
 }
 
+type SubmissionFile struct {
+	Path        string
+	Submission  Submission
+	IndexCommit string
+	ReviewedAt  time.Time
+}
+
 type Source struct {
 	Repository     string `json:"repository"`
 	ModuleDir      string `json:"moduleDir"`

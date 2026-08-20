@@ -1,0 +1,35 @@
+{
+  "apiVersion": "agent-studio.dev/v1alpha1",
+  "kind": "NodePackageSubmission",
+  "name": "github.com/example/agent-nodes",
+  "version": "v1.2.3",
+  "source": {
+    "repository": "https://github.com/example/agent-nodes",
+    "moduleDir": ".",
+    "tag": "v1.2.3",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "manifestDigest": "sha256:89abcdef89abcdef89abcdef89abcdef89abcdef89abcdef89abcdef89abcdef"
+  },
+  "categories": ["search", "integration"],
+  "keywords": ["搜索", "http"],
+  "lifecycle": {"status": "active", "message": ""},
+  "manifest": {
+    "apiVersion": "agent-studio.dev/v1alpha1",
+    "kind": "NodePackage",
+    "metadata": {
+      "name": "github.com/example/agent-nodes",
+      "displayName": "Example Agent Nodes",
+      "description": "Example search integration nodes",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/example/agent-nodes"
+    },
+    "compatibility": {
+      "nodeAPI": "agent-studio.dev/v1alpha1",
+      "runtime": {"minVersion": "v0.3.0", "maxVersionExclusive": "v0.4.0"}
+    },
+    "registrations": [{
+      "package": "github.com/example/agent-nodes/search",
+      "nodes": [{"type": "example.search", "version": "1"}]
+    }]
+  }
+}
