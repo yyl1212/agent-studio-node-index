@@ -47,7 +47,7 @@ func Generate(input GenerateInput) (Index, error) {
 		if err != nil {
 			return Index{}, fmt.Errorf("%s: %w", file.Path, err)
 		}
-		key := submission.Name + "\x00" + submission.Version
+		key := submission.Name + "\x00" + semver.Canonical(submission.Version)
 		if _, exists := seenVersions[key]; exists {
 			return Index{}, fmt.Errorf("duplicate package version (%s, %s)", submission.Name, submission.Version)
 		}
@@ -120,6 +120,9 @@ func Generate(input GenerateInput) (Index, error) {
 }
 
 func Encode(index Index) ([]byte, error) {
+	if err := validateIndex(index); err != nil {
+		return nil, fmt.Errorf("index is invalid: %w", err)
+	}
 	canonical := canonicalIndexSlices(index)
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
@@ -264,10 +267,11 @@ func validateIndex(index Index) error {
 		}
 		seenVersions := make(map[string]struct{}, len(pkg.Versions))
 		for j, version := range pkg.Versions {
-			if _, exists := seenVersions[version.Version]; exists {
+			versionKey := semver.Canonical(version.Version)
+			if _, exists := seenVersions[versionKey]; exists {
 				return fmt.Errorf("packages[%d]: duplicate version %s", i, version.Version)
 			}
-			seenVersions[version.Version] = struct{}{}
+			seenVersions[versionKey] = struct{}{}
 			if version.Review.Status != "approved" {
 				return fmt.Errorf("packages[%d].versions[%d].review.status must be approved", i, j)
 			}

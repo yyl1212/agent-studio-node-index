@@ -293,6 +293,45 @@ func TestGenerateRejectsConflictingCuratedMetadata(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsSemanticallyEquivalentPackageVersions(t *testing.T) {
+	for _, versions := range [][2]string{
+		{"v1", "v1.0"},
+		{"v1.0", "v1.0.0"},
+		{"v1.2.3+first", "v1.2.3+second"},
+	} {
+		t.Run(versions[0]+" and "+versions[1], func(t *testing.T) {
+			input := fixtureGenerateInput()
+			input.Submissions = []SubmissionFile{
+				fixtureSubmissionFile(fixtureSubmission("github.com/example/a-nodes", versions[0])),
+				fixtureSubmissionFile(fixtureSubmission("github.com/example/a-nodes", versions[1])),
+			}
+			_, err := Generate(input)
+			if err == nil || !strings.Contains(err.Error(), "duplicate package version") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+
+	input := fixtureGenerateInput()
+	input.Submissions = []SubmissionFile{
+		fixtureSubmissionFile(fixtureSubmission("github.com/example/a-nodes", "v1.2.4")),
+		fixtureSubmissionFile(fixtureSubmission("github.com/example/a-nodes", "v1.2.3")),
+	}
+	index, err := Generate(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotVersions := []string{index.Packages[0].Versions[0].Version, index.Packages[0].Versions[1].Version}
+	if !slices.Equal(gotVersions, []string{"v1.2.3", "v1.2.4"}) {
+		t.Fatalf("versions=%v", gotVersions)
+	}
+
+	index.Packages[0].Versions[1].Version = "v1.2.3+build"
+	if _, err := Encode(index); err == nil || !strings.Contains(err.Error(), "duplicate version") {
+		t.Fatalf("Encode err=%v", err)
+	}
+}
+
 func TestGenerateRejectsInvalidEnvelopeAndBudgets(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -375,6 +414,55 @@ func TestEncodeRejectsInvalidOrOversizedIndex(t *testing.T) {
 			t.Fatalf("err=%v", err)
 		}
 	})
+}
+
+func TestEncodeRejectsStructuralBudgetsBeforeLargeScaleAllocation(t *testing.T) {
+	base, err := Generate(fixtureGenerateInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	overPackages := base
+	overPackages.Packages = make([]Package, MaxPackages+1)
+	var packageErr error
+	allocations := testing.AllocsPerRun(3, func() {
+		_, packageErr = Encode(overPackages)
+	})
+	if packageErr == nil || !strings.Contains(packageErr.Error(), "packages") {
+		t.Fatalf("package err=%v", packageErr)
+	}
+	if allocations > 20 {
+		t.Fatalf("over-budget package input allocated %.0f times before rejection", allocations)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Index)
+		want   string
+	}{
+		{"versions", func(index *Index) {
+			index.Packages[0].Versions = make([]PackageVersion, MaxVersionsPerPackage+1)
+		}, "versions"},
+		{"registrations", func(index *Index) {
+			index.Packages[0].Versions[0].Manifest.Registrations = make([]Registration, 129)
+		}, "registrations"},
+		{"nodes", func(index *Index) {
+			index.Packages[0].Versions[0].Manifest.Registrations[0].Nodes = make([]NodeRef, 513)
+		}, "nodes"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			index := base
+			index.Packages = slices.Clone(base.Packages)
+			index.Packages[0].Versions = slices.Clone(base.Packages[0].Versions)
+			index.Packages[0].Versions[0].Manifest.Registrations = slices.Clone(base.Packages[0].Versions[0].Manifest.Registrations)
+			test.mutate(&index)
+			_, err := Encode(index)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
 }
 
 func fixtureGenerateInput() GenerateInput {

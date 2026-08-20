@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +69,53 @@ func TestRunFailsClosedWhenOutputDirectoryExists(t *testing.T) {
 	}
 	if got := string(readFile(t, sentinel)); got != "unchanged" {
 		t.Fatalf("existing output modified: %q", got)
+	}
+}
+
+func TestRunCleansTemporaryOutputAfterWriteFailureAndCanRetry(t *testing.T) {
+	root, _ := makeGitRoot(t)
+	parent := t.TempDir()
+	out := filepath.Join(parent, "assets")
+	args := []string{
+		"-root", root,
+		"-release", "v0.1.0",
+		"-source-commit", "0123456789abcdef0123456789abcdef01234567",
+		"-generated-at", "2026-08-20T07:30:00Z",
+		"-out", out,
+	}
+
+	originalWrite := writeReleaseAsset
+	t.Cleanup(func() { writeReleaseAsset = originalWrite })
+	writes := 0
+	writeReleaseAsset = func(path string, data []byte) error {
+		writes++
+		if writes == 2 {
+			return errors.New("injected asset write failure")
+		}
+		return originalWrite(path, data)
+	}
+	if err := run(args); err == nil || !strings.Contains(err.Error(), "injected asset write failure") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Lstat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final output exists after failure: %v", err)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary output remains after failure: %v", entries)
+	}
+
+	writeReleaseAsset = originalWrite
+	if err := run(args); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	for _, name := range []string{"checksums.txt", "index.json", "node-index-v1alpha1.schema.json"} {
+		if _, err := os.Stat(filepath.Join(out, name)); err != nil {
+			t.Fatalf("retry asset %s: %v", name, err)
+		}
 	}
 }
 

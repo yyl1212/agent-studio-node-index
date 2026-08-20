@@ -13,6 +13,8 @@ import (
 	"github.com/yyl1212/agent-studio-node-index/internal/indexgen"
 )
 
+var writeReleaseAsset = writeAsset
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -76,19 +78,48 @@ func run(args []string) error {
 		return err
 	}
 
-	if err := os.Mkdir(*out, 0o700); err != nil {
-		return fmt.Errorf("create output directory: %w", err)
+	return publishAssets(*out, assets)
+}
+
+func publishAssets(out string, assets map[string][]byte) (err error) {
+	parent := filepath.Dir(out)
+	temporary, err := os.MkdirTemp(parent, "."+filepath.Base(out)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create temporary output directory: %w", err)
 	}
+	defer func() {
+		if temporary == "" {
+			return
+		}
+		if cleanupErr := os.RemoveAll(temporary); cleanupErr != nil {
+			cleanupErr = fmt.Errorf("clean temporary output directory: %w", cleanupErr)
+			if err == nil {
+				err = cleanupErr
+			} else {
+				err = errors.Join(err, cleanupErr)
+			}
+		}
+	}()
+
 	names := make([]string, 0, len(assets))
 	for name := range assets {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := writeAsset(filepath.Join(*out, name), assets[name]); err != nil {
+		if err := writeReleaseAsset(filepath.Join(temporary, name), assets[name]); err != nil {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
+	if _, err := os.Lstat(out); err == nil {
+		return errors.New("output directory already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errors.New("output directory cannot be inspected")
+	}
+	if err := os.Rename(temporary, out); err != nil {
+		return fmt.Errorf("publish output directory: %w", err)
+	}
+	temporary = ""
 	return nil
 }
 
