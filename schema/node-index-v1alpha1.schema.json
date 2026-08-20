@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-studio.dev/contracts/node-index-v1alpha1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "packages"],
+  "properties": {
+    "apiVersion": { "const": "agent-studio.dev/v1alpha1" },
+    "kind": { "const": "NodePackageIndex" },
+    "metadata": { "$ref": "#/$defs/indexMetadata" },
+    "packages": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/package" }
+    }
+  },
+  "$defs": {
+    "goSemver": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^v(0|[1-9][0-9]*)(?:\\.(0|[1-9][0-9]*)(?:\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?)?)?$"
+    },
+    "semver": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "stableSemver": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "githubRepository": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^https://github\\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gitOID": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "utcSecondTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+    },
+    "indexMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release", "generatedAt", "sourceCommit"],
+      "properties": {
+        "release": { "$ref": "#/$defs/stableSemver" },
+        "generatedAt": { "$ref": "#/$defs/utcSecondTimestamp" },
+        "sourceCommit": { "$ref": "#/$defs/gitOID" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "moduleDir", "tag", "commit", "manifestDigest"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/githubRepository" },
+        "moduleDir": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?:\\.|(?:[^./\\\\](?:[^/\\\\])?|\\.[^./\\\\]|[^/\\\\]{3,})(?:/(?:[^./\\\\](?:[^/\\\\])?|\\.[^./\\\\]|[^/\\\\]{3,}))*)$"
+        },
+        "tag": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "commit": { "$ref": "#/$defs/gitOID" },
+        "manifestDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "categories": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32,
+        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      }
+    },
+    "keywords": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "categories", "keywords", "versions"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "categories": { "$ref": "#/$defs/categories" },
+        "keywords": { "$ref": "#/$defs/keywords" },
+        "versions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/packageVersion" }
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "message"],
+      "properties": {
+        "status": { "enum": ["active", "deprecated", "withdrawn"] },
+        "message": { "type": "string", "maxLength": 2048 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "status": { "const": "active" },
+            "message": { "const": "" }
+          }
+        },
+        {
+          "properties": {
+            "status": { "enum": ["deprecated", "withdrawn"] },
+            "message": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[^<>]+$" }
+          }
+        }
+      ]
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviewedAt", "indexCommit"],
+      "properties": {
+        "status": { "const": "approved" },
+        "reviewedAt": { "$ref": "#/$defs/utcSecondTimestamp" },
+        "indexCommit": { "$ref": "#/$defs/gitOID" }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "kind", "metadata", "compatibility", "registrations"],
+      "properties": {
+        "apiVersion": { "const": "agent-studio.dev/v1alpha1" },
+        "kind": { "const": "NodePackage" },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "displayName", "description", "license", "repository"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "description": { "type": "string", "maxLength": 2048 },
+            "license": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "repository": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^https://[^/?#@]+(?:/[^?#]*)?$"
+            }
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nodeAPI", "runtime"],
+          "properties": {
+            "nodeAPI": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "runtime": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["minVersion", "maxVersionExclusive"],
+              "properties": {
+                "minVersion": { "$ref": "#/$defs/semver" },
+                "maxVersionExclusive": { "$ref": "#/$defs/semver" }
+              }
+            }
+          }
+        },
+        "registrations": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["package", "nodes"],
+            "properties": {
+              "package": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "nodes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 512,
+                "uniqueItems": true,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["type", "version"],
+                  "properties": {
+                    "type": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "version": { "type": "string", "minLength": 1, "maxLength": 128 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "packageVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source", "review", "lifecycle", "manifest"],
+      "properties": {
+        "version": { "$ref": "#/$defs/goSemver" },
+        "source": { "$ref": "#/$defs/source" },
+        "review": { "$ref": "#/$defs/review" },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "manifest": { "$ref": "#/$defs/manifest" }
+      }
+    }
+  }
+}

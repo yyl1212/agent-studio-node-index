@@ -1,0 +1,214 @@
+name: Release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-studio-node-index-release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build:
+    name: Build verified release assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+
+      - name: Validate release workflow regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sh scripts/check-release-workflow_test.sh
+          CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Validate release history
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! jq -e '.created == true and .deleted == false and .forced == false' "$GITHUB_EVENT_PATH" >/dev/null; then
+            echo "release tags must be newly created and must never be reused" >&2
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "$GITHUB_REF_NAME")" != "tag" ]]; then
+            echo "release ref must be an annotated Tag" >&2
+            exit 1
+          fi
+
+          head_commit=$(git rev-parse HEAD)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$head_commit" != "$tag_commit" ]]; then
+            echo "checkout HEAD does not match the release Tag commit" >&2
+            exit 1
+          fi
+
+          EXPECTED_COMMIT=$tag_commit
+          EXPECTED_TAG_OBJECT=$(git rev-parse "$GITHUB_REF_NAME")
+          export EXPECTED_COMMIT EXPECTED_TAG_OBJECT
+          bash scripts/release-gate.sh
+
+      - name: Test and generate exact assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assert_exact_assets() {
+            local directory=$1
+            local expected actual name
+            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
+            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "unexpected Release asset set in $directory" >&2
+              printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+              return 1
+            fi
+            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
+                echo "Release asset must be a non-empty regular file: $name" >&2
+                return 1
+              fi
+            done
+          }
+
+          CGO_ENABLED=0 go test ./... -count=1
+          CGO_ENABLED=0 go vet ./...
+          CGO_ENABLED=0 go run ./cmd/indexgen \
+            -root . \
+            -release "$GITHUB_REF_NAME" \
+            -source-commit "$(git rev-parse HEAD)" \
+            -generated-at "$(git show -s --format=%cI HEAD)" \
+            -out dist
+
+          assert_exact_assets dist
+          (cd dist && sha256sum --check checksums.txt)
+
+          release=$(jq -er '.metadata.release' dist/index.json)
+          source_commit=$(jq -er '.metadata.sourceCommit' dist/index.json)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$release" != "$GITHUB_REF_NAME" ]]; then
+            echo "index release does not match the current Tag" >&2
+            exit 1
+          fi
+          if [[ "$source_commit" != "$tag_commit" ]]; then
+            echo "index source commit does not match the current Tag commit" >&2
+            exit 1
+          fi
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: |
+            dist/checksums.txt
+            dist/index.json
+            dist/node-index-v1alpha1.schema.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          include-hidden-files: false
+
+  publish:
+    name: Publish immutable stable release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Regenerate expected release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assert_exact_assets() {
+            local directory=$1
+            local expected actual name
+            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
+            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "unexpected Release asset set in $directory" >&2
+              return 1
+            fi
+            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
+                echo "Release asset must be a non-empty regular file: $name" >&2
+                return 1
+              fi
+            done
+          }
+
+          assert_exact_assets dist
+          (cd dist && sha256sum --check checksums.txt)
+
+          head_commit=$(git rev-parse HEAD)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$head_commit" != "$tag_commit" ]]; then
+            echo "publish checkout HEAD does not match the current Tag commit" >&2
+            exit 1
+          fi
+          release=$(jq -er '.metadata.release' dist/index.json)
+          source_commit=$(jq -er '.metadata.sourceCommit' dist/index.json)
+          if [[ "$release" != "$GITHUB_REF_NAME" ]]; then
+            echo "downloaded index release does not match the current Tag" >&2
+            exit 1
+          fi
+          if [[ "$source_commit" != "$tag_commit" ]]; then
+            echo "downloaded index source commit does not match the current Tag commit" >&2
+            exit 1
+          fi
+
+          CGO_ENABLED=0 go run ./cmd/indexgen \
+            -root . \
+            -release "$GITHUB_REF_NAME" \
+            -source-commit "$tag_commit" \
+            -generated-at "$(git show -s --format=%cI HEAD)" \
+            -out expected
+          assert_exact_assets expected
+          for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+            cmp --silent "dist/$name" "expected/$name"
+          done
+
+      - name: Publish verified immutable release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_DIST_DIR: dist
+          RELEASE_EXPECTED_DIR: expected
+        run: |
+          bash scripts/release-publish.sh
