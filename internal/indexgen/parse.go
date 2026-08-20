@@ -622,11 +622,16 @@ func validateManifest(value Submission) error {
 }
 
 func validateRegistrations(modulePath string, registrations []Registration) error {
+	type nodeIdentity struct {
+		Type    string
+		Version string
+	}
+
 	if len(registrations) > 128 {
 		return errors.New("manifest.registrations must contain at most 128 values")
 	}
 	totalNodes := 0
-	seenNodes := make(map[string]struct{})
+	seenNodes := make(map[nodeIdentity]struct{})
 	for i, registration := range registrations {
 		field := fmt.Sprintf("manifest.registrations[%d]", i)
 		if !codePointLength(registration.Package, 1, 512) || module.CheckImportPath(registration.Package) != nil || (registration.Package != modulePath && !strings.HasPrefix(registration.Package, modulePath+"/")) {
@@ -644,7 +649,7 @@ func validateRegistrations(modulePath string, registrations []Registration) erro
 			if !codePointLength(node.Version, 1, 128) {
 				return fmt.Errorf("%s.version must contain 1..128 code points", nodeField)
 			}
-			key := node.Type + "\x00" + node.Version
+			key := nodeIdentity{Type: node.Type, Version: node.Version}
 			if _, exists := seenNodes[key]; exists {
 				return fmt.Errorf("duplicate manifest node (%s, %s)", node.Type, node.Version)
 			}

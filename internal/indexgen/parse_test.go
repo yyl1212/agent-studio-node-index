@@ -301,6 +301,48 @@ func TestParseSubmissionSemanticValidation(t *testing.T) {
 	}
 }
 
+func TestParseSubmissionNodeIdentityUsesExactTuple(t *testing.T) {
+	tests := []struct {
+		name    string
+		nodes   []any
+		wantErr string
+	}{
+		{
+			name: "distinct tuples containing NUL",
+			nodes: []any{
+				map[string]any{"type": "a", "version": "\x00b"},
+				map[string]any{"type": "a\x00", "version": "b"},
+			},
+		},
+		{
+			name: "identical tuple",
+			nodes: []any{
+				map[string]any{"type": "a\x00", "version": "b"},
+				map[string]any{"type": "a\x00", "version": "b"},
+			},
+			wantErr: "duplicate manifest node",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := mutateValidSubmission(t, func(value map[string]any) {
+				firstSubmissionRegistration(value)["nodes"] = test.nodes
+			})
+			_, err := ParseSubmission(test.name, data)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("distinct tuples rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func TestLoadSubmissionsRejectsSymlinkBeforeReading(t *testing.T) {
 	root := t.TempDir()
 	packages := filepath.Join(root, "packages")
