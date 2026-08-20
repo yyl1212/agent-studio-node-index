@@ -16,6 +16,18 @@ require "digest"
 root = ARGV.fetch(0)
 workflow_path = File.join(root, ".github", "workflows", "release.yml")
 abort "release workflow is missing: #{workflow_path}" unless File.file?(workflow_path)
+actionlint_config_path = File.join(root, ".github", "actionlint.yaml")
+abort "actionlint forward-compatibility config is missing: #{actionlint_config_path}" unless File.file?(actionlint_config_path)
+
+actionlint_config = YAML.safe_load(File.read(actionlint_config_path), permitted_classes: [], permitted_symbols: [], aliases: false)
+expected_actionlint_config = {
+  "paths" => {
+    ".github/workflows/release.yml" => {
+      "ignore" => ['\Aunexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"\z'],
+    },
+  },
+}
+abort "actionlint config must ignore only the pinned v1.7.12 queue schema lag" unless actionlint_config == expected_actionlint_config
 
 raw_workflow = File.read(workflow_path)
 workflow = YAML.safe_load(
@@ -40,6 +52,7 @@ def validate(workflow, raw_workflow)
   assert.call(workflow.fetch("concurrency", nil) == {
     "group" => "agent-studio-node-index-release",
     "cancel-in-progress" => false,
+    "queue" => "max",
   }, "release workflow must use one fixed non-cancelling concurrency group")
 
   jobs = workflow.fetch("jobs", {})
@@ -94,18 +107,16 @@ def validate(workflow, raw_workflow)
   [
     ".created == true and .deleted == false and .forced == false",
     "release tags must be newly created and must never be reused",
-    "gh api --include",
-    "a Release already exists for $GITHUB_REF_NAME",
-    "gh api --paginate",
-    "semver.Compare(previous, current) >= 0",
-    "git rev-parse \"${previous_tag}^{commit}\"",
-    "git merge-base --is-ancestor",
     "git rev-parse \"${GITHUB_REF_NAME}^{commit}\"",
-    "releases/tags/$GITHUB_REF_NAME",
+    "EXPECTED_COMMIT=$tag_commit",
+    "EXPECTED_TAG_OBJECT=$(git rev-parse \"$GITHUB_REF_NAME\")",
+    "export EXPECTED_COMMIT EXPECTED_TAG_OBJECT",
+    "bash scripts/release-gate.sh",
   ].each do |fragment|
     assert.call(history_run.include?(fragment), "release history validation missing: #{fragment}")
   end
   assert.call(history_run.include?('[[ "$head_commit" != "$tag_commit" ]]'), "release history validation must compare HEAD with the Tag commit")
+  assert.call(!history_run.include?("releases?per_page=") && !history_run.include?("gh api --paginate"), "Release list must not be authoritative history")
 
   generate_run = build_by_name.fetch("Test and generate exact assets").fetch("run", "")
   [
@@ -172,41 +183,6 @@ unless failures.empty?
   exit 1
 end
 
-history_run = workflow.fetch("jobs").fetch("build").fetch("steps")[2].fetch("run")
-semver_source = history_run[/cat >"\$semver_checker" <<'GO'\n(.*?)\nGO\n/m, 1]
-abort "unable to extract the Release SemVer checker" unless semver_source
-
-Dir.mktmpdir("release-workflow-semver") do |directory|
-  checker = File.join(directory, "release-semver.go")
-  File.write(checker, semver_source)
-  environment = {
-    "CGO_ENABLED" => "0",
-    "GOCACHE" => File.join(directory, "go-cache"),
-  }
-
-  stdout, stderr, status = Open3.capture3(
-    environment,
-    "go", "run", checker, "v0.3.0",
-    stdin_data: "v0.1.0\nv0.2.0\nlegacy-release\n",
-    chdir: root,
-  )
-  abort "increasing stable Release fixture failed: #{stderr}" unless status.success? && stdout == "v0.2.0"
-
-  [
-    ["v0.2.0", "v0.2.0\n", "equal Release"],
-    ["v0.1.0", "v0.2.0\n", "decreasing Release"],
-    ["v0.3.0-rc.1", "v0.2.0\n", "prerelease"],
-  ].each do |current, previous, description|
-    _stdout, _stderr, failed_status = Open3.capture3(
-      environment,
-      "go", "run", checker, current,
-      stdin_data: previous,
-      chdir: root,
-    )
-    abort "Release SemVer checker accepted #{description}" if failed_status.success?
-  end
-end
-
 generate_run = workflow.fetch("jobs").fetch("build").fetch("steps")[3].fetch("run")
 asset_checker = generate_run[/(assert_exact_assets\(\) \{.*?\n\})\n\nCGO_ENABLED/m, 1]
 abort "unable to extract the exact asset checker" unless asset_checker
@@ -242,12 +218,12 @@ end
 mutations = {
   "wrong trigger" => ->(copy) { copy["on"] = {"pull_request_target" => {}} },
   "global write permission" => ->(copy) { copy["permissions"] = {"contents" => "write"} },
+  "default single pending concurrency" => ->(copy) { copy["concurrency"].delete("queue") },
   "publish read permission" => ->(copy) { copy["jobs"]["publish"]["permissions"] = {"contents" => "read"} },
   "mutable Action ref" => ->(copy) { copy["jobs"]["build"]["steps"][0]["uses"] = "actions/checkout@v6" },
   "shallow checkout" => ->(copy) { copy["jobs"]["build"]["steps"][0]["with"]["fetch-depth"] = 1 },
   "reused Tag accepted" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!(".created == true", ".created == false") },
-  "missing SemVer ordering" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("semver.Compare(previous, current) >= 0", "false") },
-  "missing ancestor check" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("git merge-base --is-ancestor", "git merge-base") },
+  "missing exact history gate" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("bash scripts/release-gate.sh", ":") },
   "missing source commit check" => ->(copy) { copy["jobs"]["build"]["steps"][3]["run"].sub!('[[ "$source_commit" != "$tag_commit" ]]', "false") },
   "missing exact asset check" => ->(copy) { copy["jobs"]["publish"]["steps"][3]["run"].sub!("assert_exact_assets dist", ":") },
 }
@@ -261,6 +237,7 @@ mutations.each do |name, mutate|
 end
 RUBY
 
+sh "$script_dir/release-history_test.sh"
 sh "$script_dir/release-publish_test.sh"
 
 printf 'Release workflow contract tests passed\n'

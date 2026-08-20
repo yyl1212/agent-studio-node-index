@@ -30,7 +30,7 @@ git push origin refs/tags/v0.1.0
 新 annotated Tag
       │
       v
-固定 repository-wide concurrency group（不取消运行）
+固定 repository-wide concurrency group（queue: max，不取消运行）
       │
       v
 build（contents:read）
@@ -41,14 +41,16 @@ build（contents:read）
       v
 publish（contents:write）
   下载并用 cmd/indexgen 重建、逐字节复核
-  重新枚举完整 stable Release、SemVer、祖先和远端 Tag
+  有界枚举远端 Tag → 逐 Tag 精确查询 Release → SemVer/祖先复核
   创建 draft 并记录精确 Release ID → 上传三资产 → API 校验
   回下载 → 逐字节比较
   再次解析远端 Tag → 转为 stable/latest
   硬墙钟 60 秒内逐轮解析远端 Tag、单次读取 Release API
 ```
 
-所有 Release workflow 共享固定并发组，后来的 Tag run 不会取消正在发布的 run；但 workflow 不依赖排队顺序保证正确性，`publish` 会在创建 draft 的紧邻门禁中重新读取全部完整 stable Release、严格比较 SemVer、解析前一远端 annotated Tag 并验证祖先关系。
+所有 Release workflow 共享固定并发组并设置 `queue: max`，后来的 Tag run 不会取消正在发布或等待的 run。该平台队列最多保留 100 个 pending run，不是无限队列；等待项的启动受平台 FIFO 边界约束，但 workflow 不把调度或完成顺序当作版本正确性保证。
+
+`build` 与 `publish` 使用同一个历史门禁；`publish` 会在 draft 创建前再次完整执行。门禁不使用可能有索引复制延迟的 Release list：它在硬 60 秒墙钟内最多读取 200 条远端 `v*` Tag ref，只保留最多 100 个对象和 peeled commit 均唯一的 annotated full stable SemVer Tag，再对每个候选调用固定 API 版本的精确 Release-by-tag endpoint。干净 404 表示该 Tag 没有已发布 Release；仅非 draft、非 prerelease 且存在 `published_at` 的响应计入历史，畸形 JSON、歧义 Tag、非 404 API 错误或超出上限都失败关闭。门禁用真实 Go SemVer 比较得到最高 previous Release，重新解析其 annotated Tag，并在创建 draft 的紧邻阶段验证 previous commit 是当前 commit 的祖先；当前 Tag 的 Release 缺失也在枚举前后精确复核。
 
 `publish` 在所有只读验证完成前不会创建 Release。draft 只能上传 `checksums.txt`、`index.json` 和 `node-index-v1alpha1.schema.json`。创建响应中的精确 Release ID 会被保留到整个 publish 状态机结束；失败或取消时，只在该 ID 仍是同 Tag、同 target commit、非 immutable draft 且远端 Tag 仍未漂移时才删除，绝不按模糊 Tag 删除，也绝不删除已发布 Release。转正前会回下载三者并逐字节比较；转正后必须在覆盖整个 poll 的硬 60 秒墙钟内观察到字面元组 `false false true <当前 Tag>`，并从每轮唯一一次 Release API 响应验证 ID、target 和三个 `sha256:` digest。
 

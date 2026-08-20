@@ -11,6 +11,7 @@ permissions:
 concurrency:
   group: agent-studio-node-index-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
@@ -52,81 +53,10 @@ jobs:
             exit 1
           fi
 
-          release_probe=$(mktemp "$RUNNER_TEMP/release-probe.XXXXXX")
-          release_tags=$(mktemp "$RUNNER_TEMP/release-tags.XXXXXX")
-          semver_checker=$(mktemp "$RUNNER_TEMP/release-semver.XXXXXX.go")
-          trap 'rm -f "$release_probe" "$release_tags" "$semver_checker"' EXIT
-
-          if gh api --include \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            -H "X-GitHub-Api-Version: 2026-03-10" >"$release_probe" 2>&1; then
-            echo "a Release already exists for $GITHUB_REF_NAME" >&2
-            exit 1
-          elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_probe"; then
-            cat "$release_probe" >&2
-            echo "unable to prove that the Release does not exist" >&2
-            exit 1
-          fi
-
-          gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
-            >"$release_tags"
-
-          cat >"$semver_checker" <<'GO'
-          package main
-
-          import (
-            "bufio"
-            "fmt"
-            "os"
-            "strings"
-
-            "golang.org/x/mod/semver"
-          )
-
-          func stableFull(version string) bool {
-            return semver.IsValid(version) && semver.Canonical(version) == version && semver.Prerelease(version) == "" && semver.Build(version) == ""
-          }
-
-          func main() {
-            current := os.Args[1]
-            if !stableFull(current) {
-              fmt.Fprintf(os.Stderr, "%s is not stable full SemVer\n", current)
-              os.Exit(1)
-            }
-            previous := ""
-            scanner := bufio.NewScanner(os.Stdin)
-            for scanner.Scan() {
-              candidate := strings.TrimSpace(scanner.Text())
-              if !stableFull(candidate) {
-                continue
-              }
-              if previous == "" || semver.Compare(candidate, previous) > 0 {
-                previous = candidate
-              }
-            }
-            if err := scanner.Err(); err != nil {
-              fmt.Fprintln(os.Stderr, err)
-              os.Exit(1)
-            }
-            if previous != "" && semver.Compare(previous, current) >= 0 {
-              fmt.Fprintf(os.Stderr, "current release %s must be greater than previous release %s\n", current, previous)
-              os.Exit(1)
-            }
-            fmt.Print(previous)
-          }
-          GO
-
-          previous_tag=$(CGO_ENABLED=0 go run "$semver_checker" "$GITHUB_REF_NAME" <"$release_tags")
-          if [[ -n "$previous_tag" ]]; then
-            previous_commit=$(git rev-parse "${previous_tag}^{commit}")
-            if ! git merge-base --is-ancestor "$previous_commit" "$tag_commit"; then
-              echo "previous complete Release Tag is not an ancestor of the current Tag" >&2
-              exit 1
-            fi
-          fi
+          EXPECTED_COMMIT=$tag_commit
+          EXPECTED_TAG_OBJECT=$(git rev-parse "$GITHUB_REF_NAME")
+          export EXPECTED_COMMIT EXPECTED_TAG_OBJECT
+          bash scripts/release-gate.sh
 
       - name: Test and generate exact assets
         shell: bash

@@ -16,10 +16,13 @@ root = ARGV.fetch(0)
 publish_script = File.join(root, "scripts", "release-publish.sh")
 gate_script = File.join(root, "scripts", "release-gate.sh")
 lib_script = File.join(root, "scripts", "release-lib.sh")
+history_script = File.join(root, "scripts", "release-history.sh")
 case_names = [
   "existing Release blocks draft creation",
-  "newer stable Release blocks draft creation",
+  "lagged newer stable Release blocks draft creation",
+  "malformed or failed exact history lookup blocks draft creation",
   "non-ancestor stable Release blocks draft creation",
+  "previous annotated Tag drift blocks draft creation",
   "history and assets precede draft creation",
   "post-create failure deletes the exact safe draft ID",
   "post-create cancellation deletes the exact safe draft ID",
@@ -31,7 +34,7 @@ case_names = [
   "remote Tag drift after final API response blocks verification",
   "hard poll timeout terminates an overrun request",
 ]
-missing = [publish_script, gate_script, lib_script].reject { |path| File.file?(path) }
+missing = [publish_script, gate_script, lib_script, history_script].reject { |path| File.file?(path) }
 unless missing.empty?
   case_names.each { |name| warn "not ok - #{name}: release state machine is missing" }
   abort "missing production scripts: #{missing.join(', ')}"
@@ -93,12 +96,34 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
   args = ARGV
   scenario = ENV.fetch("FAKE_SCENARIO")
   if args[0] == "api"
+    unless args.each_cons(2).any? { |left, right| left == "-H" && right == "X-GitHub-Api-Version: 2026-03-10" }
+      log("invalid-api-version")
+      warn "missing fixed GitHub API version"
+      exit 2
+    end
     method_index = args.index("--method")
     method = method_index ? args.fetch(method_index + 1) : "GET"
     endpoint = args.find { |arg| arg.start_with?("repos/") }
     releases_endpoint = "repos/#{ENV.fetch('GITHUB_REPOSITORY')}/releases"
     if method == "POST" && endpoint == releases_endpoint
-      log("create-id:42")
+      fields = []
+      args.each_index do |index|
+        fields << args[index + 1] if ["-f", "-F"].include?(args[index])
+      end
+      expected_fields = [
+        "tag_name=#{ENV.fetch('GITHUB_REF_NAME')}",
+        "target_commitish=#{ENV.fetch('EXPECTED_COMMIT')}",
+        "name=#{ENV.fetch('GITHUB_REF_NAME')}",
+        "body=Agent Studio 官方精选节点包索引 #{ENV.fetch('GITHUB_REF_NAME')}",
+        "draft=true",
+        "prerelease=false",
+      ]
+      unless fields == expected_fields
+        log("invalid-create-fields:#{fields.join('|')}")
+        warn "invalid draft creation fields"
+        exit 2
+      end
+      log("create-validated-id:42")
       set_state("draft")
       puts JSON.generate(release(draft: true, immutable: false))
     elsif method == "DELETE" && endpoint == "#{releases_endpoint}/42"
@@ -123,23 +148,51 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
       else
         puts JSON.generate(release(draft: true, immutable: false))
       end
-    elsif method == "GET" && endpoint == "#{releases_endpoint}/tags/#{ENV.fetch('GITHUB_REF_NAME')}"
-      if state == "published"
+    elsif method == "GET" && endpoint&.start_with?("#{releases_endpoint}/tags/")
+      tag = endpoint.delete_prefix("#{releases_endpoint}/tags/")
+      if tag == ENV.fetch("GITHUB_REF_NAME") && state == "published"
         log("final-release")
         File.write(File.join(ENV.fetch("FAKE_STATE_DIR"), "final-response-drift"), "") if scenario == "final_response_drift"
         sleep 5 if scenario == "timeout"
         puts JSON.generate(release(draft: false, immutable: true))
-      elsif scenario == "existing_release"
+      elsif tag == ENV.fetch("GITHUB_REF_NAME") && scenario == "existing_release"
         log("current-release:200")
         puts JSON.generate(release(draft: false, immutable: true))
-      else
+      elsif tag == ENV.fetch("GITHUB_REF_NAME")
         log("current-release:404")
+        warn "gh: Not Found (HTTP 404)"
+        exit 1
+      elsif scenario == "malformed_history" && tag == "v0.1.0"
+        log("exact-history-malformed:#{tag}")
+        puts JSON.generate({
+          "id" => 10,
+          "tag_name" => tag,
+          "target_commitish" => ENV.fetch("PREVIOUS_COMMIT"),
+          "draft" => false,
+          "prerelease" => false,
+        })
+      elsif scenario == "history_error" && tag == "v0.1.0"
+        log("exact-history-error:#{tag}")
+        warn "gh: server failure (HTTP 500)"
+        exit 1
+      elsif tag == "v0.1.0" || tag == "v0.3.0"
+        log("exact-history-published:#{tag}")
+        puts JSON.generate({
+          "id" => tag == "v0.3.0" ? 30 : 10,
+          "tag_name" => tag,
+          "target_commitish" => tag == "v0.3.0" ? "f" * 40 : ENV.fetch("PREVIOUS_COMMIT"),
+          "draft" => false,
+          "prerelease" => false,
+          "published_at" => "2026-08-20T00:00:00Z",
+        })
+      else
+        log("exact-history-404:#{tag}")
         warn "gh: Not Found (HTTP 404)"
         exit 1
       end
     elsif method == "GET" && endpoint == "#{releases_endpoint}?per_page=100"
-      log("list-stable-releases")
-      puts(scenario == "newer_release" ? "v0.3.0" : "v0.1.0")
+      log("stale-list-stable-releases")
+      puts "v0.1.0"
     else
       log("unexpected-api:#{args.join(' ')}")
       warn "unexpected fake gh api call: #{args.join(' ')}"
@@ -171,7 +224,13 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
   end
 
   if args[0, 2] == ["release", "edit"]
-    log("edit:#{args.drop(2).join(':')}")
+    expected = ["release", "edit", ENV.fetch("GITHUB_REF_NAME"), "--draft=false", "--prerelease=false", "--latest"]
+    unless args == expected
+      log("invalid-edit:#{args.join('|')}")
+      warn "invalid immutable promotion fields"
+      exit 2
+    end
+    log("edit-validated:#{args.drop(2).join(':')}")
     set_state("published")
     exit
   end
@@ -201,7 +260,24 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
       puts ENV.fetch("PREVIOUS_COMMIT")
     end
   when "ls-remote"
-    if args.join(" ").include?("refs/tags/#{ENV.fetch('GITHUB_REF_NAME')}")
+    if args == ["ls-remote", "--tags", "origin", "refs/tags/v*"]
+      log("enumerate-tags")
+      if scenario == "too_many_tags"
+        101.times do |index|
+          puts "#{ENV.fetch('PREVIOUS_TAG_OBJECT')}\trefs/tags/v1.0.#{index}"
+          puts "#{ENV.fetch('PREVIOUS_COMMIT')}\trefs/tags/v1.0.#{index}^{}"
+        end
+        exit
+      end
+      puts "#{ENV.fetch('PREVIOUS_TAG_OBJECT')}\trefs/tags/v0.1.0"
+      puts "#{ENV.fetch('PREVIOUS_COMMIT')}\trefs/tags/v0.1.0^{}"
+      puts "#{ENV.fetch('EXPECTED_TAG_OBJECT')}\trefs/tags/#{ENV.fetch('GITHUB_REF_NAME')}"
+      puts "#{ENV.fetch('EXPECTED_COMMIT')}\trefs/tags/#{ENV.fetch('GITHUB_REF_NAME')}^{}"
+      if scenario == "lagged_newer_release"
+        puts "#{'e' * 40}\trefs/tags/v0.3.0"
+        puts "#{'f' * 40}\trefs/tags/v0.3.0^{}"
+      end
+    elsif args.join(" ").include?("refs/tags/#{ENV.fetch('GITHUB_REF_NAME')}")
       count_path = File.join(ENV.fetch("FAKE_STATE_DIR"), "current-tag-lookups")
       count = File.file?(count_path) ? File.read(count_path).to_i + 1 : 1
       File.write(count_path, "#{count}\n")
@@ -219,8 +295,10 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
       puts "#{commit}\trefs/tags/#{ENV.fetch('GITHUB_REF_NAME')}^{}"
     else
       log("ls-remote-previous")
-      puts "#{ENV.fetch('PREVIOUS_TAG_OBJECT')}\trefs/tags/v0.1.0"
-      puts "#{ENV.fetch('PREVIOUS_COMMIT')}\trefs/tags/v0.1.0^{}"
+      object = scenario == "previous_tag_drift" ? "e" * 40 : ENV.fetch("PREVIOUS_TAG_OBJECT")
+      commit = scenario == "previous_tag_drift" ? "f" * 40 : ENV.fetch("PREVIOUS_COMMIT")
+      puts "#{object}\trefs/tags/v0.1.0"
+      puts "#{commit}\trefs/tags/v0.1.0^{}"
     end
   when "merge-base"
     log(args.join(" "))
@@ -232,35 +310,39 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
   end
 FAKE_GIT_RUBY
 
-FAKE_GO = <<~'FAKE_GO_RUBY'
-  #!/usr/bin/env ruby
-  input = $stdin.read
-  File.open(ENV.fetch("FAKE_CALL_LOG"), "a") { |file| file.puts("go:semver:#{input.lines.map(&:strip).join(',')}") }
-  if input.lines.map(&:strip).include?("v0.3.0")
-    warn "current release must be greater than previous release"
-    exit 1
-  end
-  print "v0.1.0" if input.lines.map(&:strip).include?("v0.1.0")
-FAKE_GO_RUBY
-
 FAKE_TIMEOUT = <<~'FAKE_TIMEOUT_RUBY'
   #!/usr/bin/env ruby
   arguments = ARGV.dup
-  arguments.shift while arguments.first&.start_with?("--")
-  seconds = Float(arguments.shift.delete_suffix("s"))
+  unless arguments.shift == "--signal=KILL"
+    warn "timeout must use --signal=KILL"
+    exit 2
+  end
+  budget = arguments.shift
+  unless budget&.match?(/\A[1-9][0-9]*s\z/)
+    warn "timeout must use a positive integral second budget"
+    exit 2
+  end
+  seconds = Float(budget.delete_suffix("s"))
+  role = case File.basename(arguments.fetch(1, ""))
+         when "release-history.sh" then "history"
+         when "release-poll.sh" then "poll"
+         else
+           warn "timeout wrapped an unexpected command: #{arguments.join(' ')}"
+           exit 2
+         end
   started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   File.open(ENV.fetch("FAKE_CALL_LOG"), "a") do |file|
-    file.puts("timeout:budget:#{seconds}")
-    file.puts("timeout:start:#{started}")
+    file.puts("timeout:#{role}:signal:KILL:budget:#{seconds}")
+    file.puts("timeout:#{role}:start:#{started}")
   end
-  pid = Process.spawn(*arguments, pgroup: true, out: File::NULL, err: File::NULL)
+  pid = Process.spawn(*arguments, pgroup: true)
   deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
   loop do
     waited = Process.waitpid2(pid, Process::WNOHANG)
     exit waited[1].exitstatus if waited
     if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
       finished = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      File.open(ENV.fetch("FAKE_CALL_LOG"), "a") { |file| file.puts("timeout:kill:#{finished}") }
+      File.open(ENV.fetch("FAKE_CALL_LOG"), "a") { |file| file.puts("timeout:#{role}:kill:#{finished}") }
       Process.kill("KILL", -pid)
       Process.waitpid(pid)
       exit 124
@@ -316,7 +398,6 @@ def setup_fixture(directory)
 
   write_executable(File.join(paths["bin"], "gh"), FAKE_GH)
   write_executable(File.join(paths["bin"], "git"), FAKE_GIT)
-  write_executable(File.join(paths["bin"], "go"), FAKE_GO)
   write_executable(File.join(paths["bin"], "timeout"), FAKE_TIMEOUT)
   write_executable(File.join(paths["bin"], "sha256sum"), FAKE_SHA256SUM)
   write_executable(File.join(paths["bin"], "cmp"), FAKE_CMP)
@@ -337,6 +418,8 @@ def setup_fixture(directory)
     "EXPECTED_TAG_OBJECT" => EXPECTED_TAG_OBJECT,
     "PREVIOUS_COMMIT" => PREVIOUS_COMMIT,
     "PREVIOUS_TAG_OBJECT" => PREVIOUS_TAG_OBJECT,
+    "CGO_ENABLED" => "0",
+    "GOCACHE" => "/private/tmp/agent-studio-node-index-go-cache",
   }
 end
 
@@ -346,7 +429,8 @@ def run_case(publish_script, scenario)
     environment["FAKE_SCENARIO"] = scenario
     yield(environment) if block_given?
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    _stdout, stderr, status = Open3.capture3(environment, "bash", publish_script, chdir: directory)
+    repository_root = File.dirname(File.dirname(publish_script))
+    _stdout, stderr, status = Open3.capture3(environment, "bash", publish_script, chdir: repository_root)
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
     log = File.file?(environment.fetch("FAKE_CALL_LOG")) ? File.read(environment.fetch("FAKE_CALL_LOG")) : ""
     return Result.new(status: status, stderr: stderr, log: log, elapsed: elapsed)
@@ -409,43 +493,59 @@ end
 existing = run_case(publish_script, "existing_release")
 assert.call(!existing.status.success?, "existing Release fixture unexpectedly succeeded")
 assert.call(existing.log.include?("gh:current-release:200"), "existing Release was not queried")
-assert.call(!existing.log.include?("gh:create-id:"), "existing Release did not block draft creation")
+assert.call(!existing.log.include?("gh:create-validated-id:"), "existing Release did not block draft creation")
 
-newer = run_case(publish_script, "newer_release")
+newer = run_case(publish_script, "lagged_newer_release")
 assert.call(!newer.status.success?, "newer stable Release fixture unexpectedly succeeded")
-assert.call(newer.log.include?("gh:list-stable-releases"), "publish did not freshly enumerate stable Releases")
-assert.call(!newer.log.include?("gh:create-id:"), "newer stable Release did not block draft creation")
+assert.call(newer.log.include?("git:enumerate-tags"), "publish did not freshly enumerate remote Tags")
+assert.call(newer.log.include?("gh:exact-history-published:v0.3.0"), "publish did not query the lagged newer Release by exact Tag")
+assert.call(!newer.log.include?("gh:stale-list-stable-releases"), "publish still trusted the lagged Release list")
+assert.call(!newer.log.include?("gh:create-validated-id:"), "newer stable Release did not block draft creation")
+
+%w[malformed_history history_error too_many_tags].each do |scenario|
+  failed_history = run_case(publish_script, scenario)
+  assert.call(!failed_history.status.success?, "#{scenario} fixture unexpectedly succeeded")
+  assert.call(!failed_history.log.include?("gh:create-validated-id:"), "#{scenario} did not block draft creation")
+end
 
 nonancestor = run_case(publish_script, "nonancestor")
 assert.call(!nonancestor.status.success?, "non-ancestor fixture unexpectedly succeeded")
 assert.call(nonancestor.log.include?("git:merge-base --is-ancestor"), "publish did not check the fresh previous Tag ancestor")
-assert.call(!nonancestor.log.include?("gh:create-id:"), "non-ancestor stable Release did not block draft creation")
+assert.call(!nonancestor.log.include?("gh:create-validated-id:"), "non-ancestor stable Release did not block draft creation")
+
+previous_drift = run_case(publish_script, "previous_tag_drift")
+assert.call(!previous_drift.status.success?, "previous Tag drift fixture unexpectedly succeeded")
+assert.call(previous_drift.log.include?("git:ls-remote-previous"), "publish did not freshly resolve the highest previous annotated Tag")
+assert.call(!previous_drift.log.include?("gh:create-validated-id:"), "previous annotated Tag drift did not block draft creation")
 
 invalid_assets = run_case(publish_script, "success") do |environment|
   File.delete(File.join(environment.fetch("RELEASE_DIST_DIR"), "node-index-v1alpha1.schema.json"))
 end
 assert.call(!invalid_assets.status.success?, "missing asset fixture unexpectedly succeeded")
-assert.call(!invalid_assets.log.include?("gh:create-id:"), "draft creation occurred before exact asset validation")
+assert.call(!invalid_assets.log.include?("gh:create-validated-id:"), "draft creation occurred before exact asset validation")
 
 ordered = run_case(publish_script, "success") do |environment|
   environment.delete("RELEASE_POLL_TIMEOUT_SECONDS")
 end
 assert.call(ordered.status.success?, "valid publication fixture failed: #{ordered.stderr}")
 calls = ordered.log.lines.map(&:strip)
-create_index = calls.index { |line| line.start_with?("gh:create-id:") }
+create_index = calls.index { |line| line.start_with?("gh:create-validated-id:") }
 checksum_index = calls.index { |line| line.start_with?("sha256sum:--check") }
 compare_index = calls.index { |line| line.start_with?("cmp:") }
-history_index = calls.index("gh:list-stable-releases")
+history_index = calls.index("gh:exact-history-published:v0.1.0")
 assert.call(create_index && checksum_index && checksum_index < create_index, "checksum validation did not precede draft creation")
 assert.call(create_index && compare_index && compare_index < create_index, "byte comparison did not precede draft creation")
 assert.call(create_index && history_index && history_index < create_index, "fresh history validation did not precede draft creation")
 assert.call(!ordered.log.include?("gh:delete-id:"), "successful publication left cleanup armed")
-assert.call(ordered.log.include?("timeout:budget:60.0"), "final verification does not default to a hard 60-second wall-clock budget")
+assert.call(ordered.log.include?("gh:create-validated-id:42"), "draft POST fields were not validated by the GitHub boundary fake")
+assert.call(ordered.log.include?("gh:edit-validated:"), "promotion fields were not validated by the GitHub boundary fake")
+assert.call(ordered.log.include?("timeout:history:signal:KILL:budget:60.0"), "history enumeration lacks the exact hard timeout contract")
+assert.call(ordered.log.include?("timeout:poll:signal:KILL:budget:60.0"), "final verification does not default to the exact hard 60-second timeout contract")
 
 cleanup = run_case(publish_script, "upload_failure")
 assert.call(!cleanup.status.success?, "post-create failure fixture unexpectedly succeeded")
 assert.call(cleanup.status.exitstatus == 1, "cleanup did not preserve the original upload failure status")
-assert.call(cleanup.log.include?("gh:create-id:42"), "draft ID was not captured from creation")
+assert.call(cleanup.log.include?("gh:create-validated-id:42"), "draft ID was not captured from validated creation")
 assert.call(cleanup.log.include?("gh:get-id:42"), "cleanup did not fetch the exact draft ID")
 assert.call(cleanup.log.include?("gh:delete-id:42"), "cleanup did not delete the exact safe draft ID")
 assert.call(cleanup.stderr.include?("inspecting exact draft ID 42"), "cleanup did not preserve exact-ID diagnostics")
@@ -467,22 +567,22 @@ assert.call(!nondraft.log.include?("gh:delete-id:"), "cleanup deleted a publishe
 
 history_drift = run_case(publish_script, "tag_drift_after_history")
 assert.call(!history_drift.status.success?, "post-history Tag drift fixture unexpectedly succeeded")
-assert.call(!history_drift.log.include?("gh:create-id:"), "remote Tag drift after fresh history did not block draft creation")
+assert.call(!history_drift.log.include?("gh:create-validated-id:"), "remote Tag drift after fresh history did not block draft creation")
 
 promotion_drift = run_case(publish_script, "promotion_window_drift")
 assert.call(!promotion_drift.status.success?, "promotion-window Tag drift fixture unexpectedly succeeded")
-assert.call(!promotion_drift.log.include?("gh:edit:"), "remote Tag drift after the draft recheck did not block promotion")
+assert.call(!promotion_drift.log.include?("gh:edit-validated:"), "remote Tag drift after the draft recheck did not block promotion")
 
 final_drift = run_case(publish_script, "final_response_drift")
 assert.call(!final_drift.status.success?, "post-response final Tag drift fixture unexpectedly succeeded")
-assert.call(final_drift.log.include?("gh:edit:"), "final drift fixture never reached promotion")
+assert.call(final_drift.log.include?("gh:edit-validated:"), "final drift fixture never reached promotion")
 assert.call(!final_drift.log.include?("gh:delete-id:"), "final drift cleanup deleted a published Release")
 
 timeout = run_case(publish_script, "timeout")
 assert.call(!timeout.status.success?, "timeout fixture unexpectedly succeeded")
 assert.call(timeout.log.include?("gh:final-release"), "timeout fixture did not enter the final API request")
-timeout_started = timeout.log[/^timeout:start:([0-9.]+)$/, 1]&.to_f
-timeout_killed = timeout.log[/^timeout:kill:([0-9.]+)$/, 1]&.to_f
+timeout_started = timeout.log[/^timeout:poll:start:([0-9.]+)$/, 1]&.to_f
+timeout_killed = timeout.log[/^timeout:poll:kill:([0-9.]+)$/, 1]&.to_f
 timeout_elapsed = timeout_started && timeout_killed ? timeout_killed - timeout_started : nil
 assert.call(timeout_elapsed && timeout_elapsed < 3.0, "hard timeout did not terminate the overrun request within its 2-second test budget")
 assert.call(!timeout.log.include?("gh:delete-id:"), "timeout cleanup deleted a published Release")
