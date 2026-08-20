@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,8 +15,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/yyl1212/agent-studio-node-index/internal/indexgen"
+	"golang.org/x/mod/semver"
 )
 
 type recordingVerifier struct {
@@ -184,6 +189,103 @@ func TestIndexCheckPreflightsEntireAggregateBeforeHTTP(t *testing.T) {
 				t.Fatalf("HTTP calls=%d, want zero before aggregate preflight", transport.calls)
 			}
 		})
+	}
+}
+
+func TestIndexCheckMaximumMetadataEnvelopeIsContractValid(t *testing.T) {
+	release := independentMaximumStableRelease()
+	commit := independentMaximumGitOID()
+	if got := maximumPreflightStableRelease(); got != release {
+		t.Fatalf("production maximum release=%q, want independently constructed %q", got, release)
+	}
+	if got := maximumPreflightGitOID(); got != commit {
+		t.Fatalf("production maximum Git OID=%q, want independently constructed %q", got, commit)
+	}
+	if got := utf8.RuneCountInString(release); got != 128 {
+		t.Fatalf("maximum release code points=%d, want 128", got)
+	}
+	if len(release) != 128 || !semver.IsValid(release) || semver.Prerelease(release) != "" || semver.Build(release) != "" {
+		t.Fatalf("maximum release is not a 128-byte stable SemVer: %q", release)
+	}
+	if len(commit) != 64 || strings.Trim(commit, "0123456789abcdef") != "" {
+		t.Fatalf("maximum Git OID is not 64 lowercase hex bytes: %q", commit)
+	}
+
+	submission, err := indexgen.ParseSubmission("fixture", validCandidateBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := generateEnvelopeIndex(t, []indexgen.Submission{submission}, release, commit)
+	if index.Metadata.SourceCommit != commit || index.Packages[0].Versions[0].Review.IndexCommit != commit {
+		t.Fatalf("maximum OID did not reach every generated field: metadata=%q review=%q", index.Metadata.SourceCommit, index.Packages[0].Versions[0].Review.IndexCommit)
+	}
+	encoded := referenceCanonicalIndexEncoding(t, index)
+	value, err := jsonschema.UnmarshalJSON(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := jsonschema.NewCompiler().Compile("../../schema/node-index-v1alpha1.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schema.Validate(value); err != nil {
+		t.Fatalf("maximum metadata envelope violates the real index schema: %v", err)
+	}
+}
+
+func TestIndexCheckPreflightUsesMaximumMetadataEnvelopeBeforeHTTP(t *testing.T) {
+	boundary := newEnvelopeBoundaryFixture(t)
+	if boundary.shortCrossingBytes > indexgen.MaxIndexBytes || boundary.maximumCrossingBytes <= indexgen.MaxIndexBytes {
+		t.Fatalf(
+			"crossing fixture sizes: old-short=%d maximum=%d limit=%d",
+			boundary.shortCrossingBytes,
+			boundary.maximumCrossingBytes,
+			indexgen.MaxIndexBytes,
+		)
+	}
+	const releaseDelta = 128 - len("v0.0.0")
+	const sourceCommitDelta = 64 - 40
+	wantEnvelopeDelta := releaseDelta + sourceCommitDelta + indexgen.MaxPackages*(64-40)
+	if got := boundary.maximumCrossingBytes - boundary.shortCrossingBytes; got != wantEnvelopeDelta {
+		t.Fatalf("metadata envelope delta=%d, want hand-derived %d", got, wantEnvelopeDelta)
+	}
+	t.Logf(
+		"old-short=%d maximum=%d limit=%d envelope-delta=%d",
+		boundary.shortCrossingBytes,
+		boundary.maximumCrossingBytes,
+		indexgen.MaxIndexBytes,
+		wantEnvelopeDelta,
+	)
+
+	crossingRoot := t.TempDir()
+	crossingChanged := writeEnvelopeCorpus(t, crossingRoot, boundary.crossing)
+	crossingTransport := &successfulCountingTransport{}
+	err := runIndexCheck(
+		context.Background(),
+		[]string{"-root", crossingRoot, "-changed-file", crossingChanged},
+		func(string) string { return "" },
+		httpProbeVerifierFactory(crossingTransport),
+	)
+	if err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("crossing preflight err=%v, want maximum size rejection", err)
+	}
+	if crossingTransport.calls != 0 {
+		t.Fatalf("crossing preflight HTTP calls=%d, want zero", crossingTransport.calls)
+	}
+
+	underRoot := t.TempDir()
+	underChanged := writeEnvelopeCorpus(t, underRoot, boundary.under)
+	underTransport := &successfulCountingTransport{}
+	if err := runIndexCheck(
+		context.Background(),
+		[]string{"-root", underRoot, "-changed-file", underChanged},
+		func(string) string { return "" },
+		httpProbeVerifierFactory(underTransport),
+	); err != nil {
+		t.Fatalf("just-under-boundary corpus was rejected: %v", err)
+	}
+	if underTransport.calls != 1 {
+		t.Fatalf("just-under-boundary HTTP calls=%d, want one", underTransport.calls)
 	}
 }
 
@@ -470,4 +572,189 @@ func versions(submissions []indexgen.Submission) []string {
 		result[index] = submission.Version
 	}
 	return result
+}
+
+const envelopeFixturePackageCount = indexgen.MaxPackages
+
+type envelopeBoundaryFixture struct {
+	crossing             []indexgen.Submission
+	under                []indexgen.Submission
+	shortCrossingBytes   int
+	maximumCrossingBytes int
+}
+
+func newEnvelopeBoundaryFixture(t *testing.T) envelopeBoundaryFixture {
+	t.Helper()
+	maximumRelease := independentMaximumStableRelease()
+	maximumCommit := independentMaximumGitOID()
+	base := envelopeCorpus(t, 1)
+	baseBytes := len(referenceCanonicalIndexEncoding(t, generateEnvelopeIndex(t, base, maximumRelease, maximumCommit)))
+	second := envelopeCorpus(t, 2)
+	secondBytes := len(referenceCanonicalIndexEncoding(t, generateEnvelopeIndex(t, second, maximumRelease, maximumCommit)))
+	step := secondBytes - baseBytes
+	wantStep := 2 * envelopeFixturePackageCount
+	if step != wantStep {
+		t.Fatalf("one-rune filler step=%d, want hand-derived %d", step, wantStep)
+	}
+	if baseBytes > indexgen.MaxIndexBytes {
+		t.Fatalf("base envelope fixture size=%d already exceeds limit", baseBytes)
+	}
+	crossingFiller := 2 + (indexgen.MaxIndexBytes-baseBytes)/step
+	if crossingFiller > 2048 {
+		t.Fatalf("crossing filler=%d exceeds domain limit", crossingFiller)
+	}
+
+	crossing := envelopeCorpus(t, crossingFiller)
+	maximumCrossing := generateEnvelopeIndex(t, crossing, maximumRelease, maximumCommit)
+	maximumCrossingBytes := len(referenceCanonicalIndexEncoding(t, maximumCrossing))
+	shortCrossing := generateEnvelopeIndex(t, crossing, "v0.0.0", strings.Repeat("0", 40))
+	shortCrossingBytes := len(referenceCanonicalIndexEncoding(t, shortCrossing))
+	if _, err := indexgen.Encode(shortCrossing); err != nil {
+		t.Fatalf("old short envelope should fit: size=%d err=%v", shortCrossingBytes, err)
+	}
+	if _, err := indexgen.Encode(maximumCrossing); err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("maximum envelope should exceed limit: size=%d err=%v", maximumCrossingBytes, err)
+	}
+
+	under := envelopeCorpus(t, crossingFiller-1)
+	maximumUnderBytes := len(referenceCanonicalIndexEncoding(t, generateEnvelopeIndex(t, under, maximumRelease, maximumCommit)))
+	if maximumUnderBytes > indexgen.MaxIndexBytes || indexgen.MaxIndexBytes-maximumUnderBytes >= step {
+		t.Fatalf("under fixture size=%d is not immediately below limit=%d with step=%d", maximumUnderBytes, indexgen.MaxIndexBytes, step)
+	}
+	return envelopeBoundaryFixture{
+		crossing:             crossing,
+		under:                under,
+		shortCrossingBytes:   shortCrossingBytes,
+		maximumCrossingBytes: maximumCrossingBytes,
+	}
+}
+
+func envelopeCorpus(t *testing.T, fillerLength int) []indexgen.Submission {
+	t.Helper()
+	base, err := indexgen.ParseSubmission("fixture", validCandidateBytes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	submissions := make([]indexgen.Submission, 0, envelopeFixturePackageCount)
+	for i := range envelopeFixturePackageCount {
+		name := fmt.Sprintf("github.com/example/envelope-nodes-%04d", i)
+		repository := "https://" + name
+		submission := base
+		submission.Name = name
+		submission.Source.Repository = repository
+		submission.Categories = slices.Clone(base.Categories)
+		submission.Keywords = slices.Clone(base.Keywords)
+		submission.Lifecycle = indexgen.Lifecycle{Status: "deprecated", Message: strings.Repeat("m", fillerLength)}
+		submission.Manifest.Metadata.Name = name
+		submission.Manifest.Metadata.Description = strings.Repeat("d", fillerLength)
+		submission.Manifest.Metadata.Repository = repository
+		submission.Manifest.Registrations = make([]indexgen.Registration, len(base.Manifest.Registrations))
+		for j, registration := range base.Manifest.Registrations {
+			submission.Manifest.Registrations[j] = registration
+			submission.Manifest.Registrations[j].Nodes = slices.Clone(registration.Nodes)
+		}
+		submission.Manifest.Registrations[0].Package = name + "/search"
+		submissions = append(submissions, submission)
+	}
+	return submissions
+}
+
+func generateEnvelopeIndex(t *testing.T, submissions []indexgen.Submission, release, commit string) indexgen.Index {
+	t.Helper()
+	files := make([]indexgen.SubmissionFile, len(submissions))
+	stamp := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i, submission := range submissions {
+		files[i] = indexgen.SubmissionFile{
+			Path:        fmt.Sprintf("packages/envelope-%04d.json", i),
+			Submission:  submission,
+			IndexCommit: commit,
+			ReviewedAt:  stamp,
+		}
+	}
+	index, err := indexgen.Generate(indexgen.GenerateInput{
+		Release:      release,
+		SourceCommit: commit,
+		GeneratedAt:  stamp,
+		Submissions:  files,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return index
+}
+
+func referenceCanonicalIndexEncoding(t *testing.T, index indexgen.Index) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(index); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func independentMaximumStableRelease() string {
+	return "v" + strings.Repeat("9", 123) + ".1.1"
+}
+
+func independentMaximumGitOID() string {
+	return strings.Repeat("f", 64)
+}
+
+func writeEnvelopeCorpus(t *testing.T, root string, submissions []indexgen.Submission) string {
+	t.Helper()
+	changed := ""
+	for _, submission := range submissions {
+		data, err := json.Marshal(submission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := writeCandidateSubmission(t, root, data)
+		if changed == "" {
+			changed = filepath.ToSlash(path)
+		}
+	}
+	return changed
+}
+
+type successfulCountingTransport struct {
+	calls int
+}
+
+func (transport *successfulCountingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.calls++
+	return &http.Response{
+		StatusCode: http.StatusNoContent,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    request,
+	}, nil
+}
+
+type httpProbeVerifier struct {
+	client *http.Client
+}
+
+func (verifier *httpProbeVerifier) Verify(ctx context.Context, _ indexgen.Submission) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://preflight.invalid/verify", nil)
+	if err != nil {
+		return err
+	}
+	response, err := verifier.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
+	}
+	return nil
+}
+
+func httpProbeVerifierFactory(transport http.RoundTripper) verifierFactory {
+	return func(*http.Client, string) submissionVerifier {
+		return &httpProbeVerifier{client: &http.Client{Transport: transport}}
+	}
 }

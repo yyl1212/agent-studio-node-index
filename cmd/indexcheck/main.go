@@ -21,7 +21,13 @@ import (
 
 var candidatePathPattern = regexp.MustCompile(`^packages/[0-9a-f]{64}\.json$`)
 
-const indexCheckLimit = 30 * time.Second
+const (
+	indexCheckLimit                    = 30 * time.Second
+	maximumStableReleaseCodePointCount = 128
+	maximumStableReleasePrefix         = "v"
+	maximumStableReleaseSuffix         = ".1.1"
+	maximumGitOIDHexLength             = 64
+)
 
 type submissionVerifier interface {
 	Verify(context.Context, indexgen.Submission) error
@@ -138,8 +144,11 @@ func preflightCandidateAggregate(ctx context.Context, root string) ([]string, ma
 
 	submissions := make(map[string]indexgen.Submission, len(paths))
 	files := make([]indexgen.SubmissionFile, 0, len(paths))
+	// Contract-valid UTC second timestamps have a fixed encoded width, and Generate
+	// supplies the fixed review status "approved". Release and Git OID lengths are
+	// the only fabricated metadata widths that can vary at release time.
 	preflightTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-	preflightCommit := strings.Repeat("0", 40)
+	preflightCommit := maximumPreflightGitOID()
 	for _, relativePath := range paths {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -158,7 +167,7 @@ func preflightCandidateAggregate(ctx context.Context, root string) ([]string, ma
 	}
 
 	index, err := indexgen.Generate(indexgen.GenerateInput{
-		Release:      "v0.0.0",
+		Release:      maximumPreflightStableRelease(),
 		SourceCommit: preflightCommit,
 		GeneratedAt:  preflightTime,
 		Submissions:  files,
@@ -170,6 +179,20 @@ func preflightCandidateAggregate(ctx context.Context, root string) ([]string, ma
 		return nil, nil, fmt.Errorf("candidate aggregate is invalid: %w", err)
 	}
 	return paths, submissions, nil
+}
+
+// maximumPreflightStableRelease is a stable SemVer with the contract maximum
+// of 128 code points. Its ASCII-only digits and punctuation are never expanded
+// by JSON encoding, so no valid release can have a longer encoded value.
+func maximumPreflightStableRelease() string {
+	majorDigits := maximumStableReleaseCodePointCount - len(maximumStableReleasePrefix) - len(maximumStableReleaseSuffix)
+	return maximumStableReleasePrefix + strings.Repeat("9", majorDigits) + maximumStableReleaseSuffix
+}
+
+// maximumPreflightGitOID uses the contract's longer SHA-256 form. Lowercase hex
+// is JSON-safe, so every valid Git OID encodes to at most this length.
+func maximumPreflightGitOID() string {
+	return strings.Repeat("f", maximumGitOIDHexLength)
 }
 
 func validateCandidateRoot(root string) (string, error) {
