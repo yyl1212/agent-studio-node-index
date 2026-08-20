@@ -1,6 +1,7 @@
 package indexgen
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -148,6 +149,73 @@ func TestSchemasRejectInvalidGoSemVer(t *testing.T) {
 	}
 }
 
+func TestSchemasAcceptGoSemVerShorthand(t *testing.T) {
+	for _, version := range []string{"v1", "v1.2"} {
+		t.Run(version, func(t *testing.T) {
+			if !semver.IsValid(version) {
+				t.Fatalf("test fixture %q unexpectedly is not valid Go SemVer", version)
+			}
+
+			submission := decodeJSONObject(t, validSubmissionJSON)
+			submission["version"] = version
+			if err := compileContractSchema(t, "../../schema/submission.schema.json").Validate(submission); err != nil {
+				t.Fatalf("submission schema rejected valid Go SemVer %q: %v", version, err)
+			}
+
+			index := validIndex(t)
+			firstVersion(index)["version"] = version
+			if err := compileContractSchema(t, "../../schema/node-index-v1alpha1.schema.json").Validate(index); err != nil {
+				t.Fatalf("index schema rejected valid Go SemVer %q: %v", version, err)
+			}
+		})
+	}
+}
+
+func TestIndexSchemaRequiresUTCSecondPrecision(t *testing.T) {
+	sch := compileContractSchema(t, "../../schema/node-index-v1alpha1.schema.json")
+	if err := sch.Validate(validIndex(t)); err != nil {
+		t.Fatalf("canonical UTC second-precision timestamps rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"generatedAt offset", func(v map[string]any) { object(v, "metadata")["generatedAt"] = "2026-08-20T15:30:00+08:00" }},
+		{"generatedAt fractional seconds", func(v map[string]any) { object(v, "metadata")["generatedAt"] = "2026-08-20T07:30:00.123Z" }},
+		{"reviewedAt offset", func(v map[string]any) { object(firstVersion(v), "review")["reviewedAt"] = "2026-08-20T15:30:00+08:00" }},
+		{"reviewedAt fractional seconds", func(v map[string]any) { object(firstVersion(v), "review")["reviewedAt"] = "2026-08-20T07:30:00.123Z" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := validIndex(t)
+			tt.mutate(value)
+			if err := sch.Validate(value); err == nil {
+				t.Fatal("non-canonical timestamp accepted")
+			}
+		})
+	}
+}
+
+func TestIndexSchemaReferencesComplexObjectDefinitions(t *testing.T) {
+	document := schemaDocument(t, "../../schema/node-index-v1alpha1.schema.json")
+	properties := object(document, "properties")
+	if got := object(properties, "metadata")["$ref"]; got != "#/$defs/indexMetadata" {
+		t.Fatalf("metadata $ref=%v", got)
+	}
+	packages := object(properties, "packages")
+	if got := object(packages, "items")["$ref"]; got != "#/$defs/package" {
+		t.Fatalf("package items $ref=%v", got)
+	}
+	definitions := object(document, "$defs")
+	for _, name := range []string{"indexMetadata", "package"} {
+		if _, ok := definitions[name].(map[string]any); !ok {
+			t.Fatalf("missing object definition %q", name)
+		}
+	}
+}
+
 func compileContractSchema(t *testing.T, path string) *jsonschema.Schema {
 	t.Helper()
 	compiler := jsonschema.NewCompiler()
@@ -171,6 +239,15 @@ func decodeJSON(t *testing.T, raw string) any {
 func decodeJSONObject(t *testing.T, raw string) map[string]any {
 	t.Helper()
 	return decodeJSON(t, raw).(map[string]any)
+}
+
+func schemaDocument(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decodeJSONObject(t, string(raw))
 }
 
 func repeated(value any, count int) []any {
