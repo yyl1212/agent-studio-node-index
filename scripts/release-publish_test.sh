@@ -51,6 +51,18 @@ PREVIOUS_COMMIT = "c" * 40
 PREVIOUS_TAG_OBJECT = "d" * 40
 REMOTE_MAIN_COMMIT = "e" * 40
 
+def resolve_host_executable(name, search_path, base_directory)
+  search_path.split(File::PATH_SEPARATOR, -1).each do |entry|
+    directory = entry.empty? ? base_directory : File.expand_path(entry, base_directory)
+    candidate = File.join(directory, name)
+    return candidate if File.file?(candidate) && File.executable?(candidate)
+  end
+  nil
+end
+
+HOST_SHA256SUM = resolve_host_executable("sha256sum", ENV.fetch("PATH"), Dir.pwd)
+raise "host sha256sum is unavailable" unless HOST_SHA256SUM
+
 FAKE_GH = <<~'FAKE_GH_RUBY'
   #!/usr/bin/env ruby
   require "digest"
@@ -396,7 +408,7 @@ FAKE_SHA256SUM = <<~'SH'
   #!/bin/sh
   set -eu
   printf 'sha256sum:%s\n' "$*" >> "$FAKE_CALL_LOG"
-  exec /sbin/sha256sum "$@"
+  exec "$REAL_SHA256SUM" "$@"
 SH
 
 FAKE_CMP = <<~'SH'
@@ -460,6 +472,7 @@ def setup_fixture(directory, fake_gh = FAKE_GH)
     "PREVIOUS_COMMIT" => PREVIOUS_COMMIT,
     "PREVIOUS_TAG_OBJECT" => PREVIOUS_TAG_OBJECT,
     "REMOTE_MAIN_COMMIT" => REMOTE_MAIN_COMMIT,
+    "REAL_SHA256SUM" => HOST_SHA256SUM,
     "CGO_ENABLED" => "0",
     "GOCACHE" => "/private/tmp/agent-studio-node-index-go-cache",
   }
@@ -519,6 +532,42 @@ end
 
 failures = []
 assert = ->(condition, message) { failures << message unless condition }
+
+Dir.mktmpdir("host-tool-resolution") do |directory|
+  tool = File.join(directory, "fixture-tool")
+  write_executable(tool, "#!/bin/sh\nexit 0\n")
+  assert.call(
+    resolve_host_executable("fixture-tool", ".:/not-present", directory) == tool,
+    "host tool resolver did not normalize a relative PATH entry",
+  )
+  assert.call(
+    resolve_host_executable("fixture-tool", ":/not-present", directory) == tool,
+    "host tool resolver did not interpret an empty PATH entry as the initial directory",
+  )
+end
+
+Dir.mktmpdir("sha256sum-wrapper-behavior") do |directory|
+  environment = setup_fixture(directory)
+
+  probe = File.join(directory, "sha256sum-probe")
+  delegate = File.join(directory, "sha256sum-delegate")
+  write_executable(delegate, <<~'SH')
+    #!/bin/sh
+    set -eu
+    : > "$SHA256SUM_PROBE"
+    exec "$HOST_SHA256SUM" "$@"
+  SH
+  environment["REAL_SHA256SUM"] = delegate
+  environment["HOST_SHA256SUM"] = HOST_SHA256SUM
+  environment["SHA256SUM_PROBE"] = probe
+  _stdout, stderr, status = Open3.capture3(
+    environment,
+    "sha256sum", "--check", "checksums.txt",
+    chdir: environment.fetch("RELEASE_DIST_DIR"),
+  )
+  assert.call(status.success?, "sha256sum wrapper rejected a valid checksum fixture: #{stderr}")
+  assert.call(File.file?(probe), "sha256sum wrapper ignored the resolved host tool")
+end
 
 invalid_create_requests = {
   "raw draft boolean" => lambda do |source|
