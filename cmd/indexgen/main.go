@@ -13,7 +13,13 @@ import (
 	"github.com/yyl1212/agent-studio-node-index/internal/indexgen"
 )
 
-var writeReleaseAsset = writeAsset
+var (
+	writeReleaseAsset      = writeAsset
+	reserveOutputDirectory = func(path string) error {
+		return os.Mkdir(path, 0o700)
+	}
+	moveReleaseAsset = os.Rename
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -87,17 +93,31 @@ func publishAssets(out string, assets map[string][]byte) (err error) {
 	if err != nil {
 		return fmt.Errorf("create temporary output directory: %w", err)
 	}
+	outputReserved := false
 	defer func() {
-		if temporary == "" {
-			return
-		}
-		if cleanupErr := os.RemoveAll(temporary); cleanupErr != nil {
-			cleanupErr = fmt.Errorf("clean temporary output directory: %w", cleanupErr)
+		joinCleanupError := func(cleanupErr error) {
+			if cleanupErr == nil {
+				return
+			}
 			if err == nil {
 				err = cleanupErr
 			} else {
 				err = errors.Join(err, cleanupErr)
 			}
+		}
+		if outputReserved {
+			cleanupErr := os.RemoveAll(out)
+			if cleanupErr != nil {
+				cleanupErr = fmt.Errorf("clean reserved output directory: %w", cleanupErr)
+			}
+			joinCleanupError(cleanupErr)
+		}
+		if temporary != "" {
+			cleanupErr := os.RemoveAll(temporary)
+			if cleanupErr != nil {
+				cleanupErr = fmt.Errorf("clean temporary output directory: %w", cleanupErr)
+			}
+			joinCleanupError(cleanupErr)
 		}
 	}()
 
@@ -111,15 +131,20 @@ func publishAssets(out string, assets map[string][]byte) (err error) {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
-	if _, err := os.Lstat(out); err == nil {
-		return errors.New("output directory already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return errors.New("output directory cannot be inspected")
+	if err := reserveOutputDirectory(out); err != nil {
+		return fmt.Errorf("reserve output directory: %w", err)
 	}
-	if err := os.Rename(temporary, out); err != nil {
-		return fmt.Errorf("publish output directory: %w", err)
+	outputReserved = true
+	for _, name := range names {
+		if err := moveReleaseAsset(filepath.Join(temporary, name), filepath.Join(out, name)); err != nil {
+			return fmt.Errorf("move %s: %w", name, err)
+		}
+	}
+	if err := os.Remove(temporary); err != nil {
+		return fmt.Errorf("remove empty temporary output directory: %w", err)
 	}
 	temporary = ""
+	outputReserved = false
 	return nil
 }
 

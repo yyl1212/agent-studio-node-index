@@ -119,6 +119,92 @@ func TestRunCleansTemporaryOutputAfterWriteFailureAndCanRetry(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotOverwriteOutputCreatedImmediatelyBeforeReservation(t *testing.T) {
+	root, _ := makeGitRoot(t)
+	parent := t.TempDir()
+	out := filepath.Join(parent, "assets")
+	sentinel := filepath.Join(out, "sentinel")
+	args := []string{
+		"-root", root,
+		"-release", "v0.1.0",
+		"-source-commit", "0123456789abcdef0123456789abcdef01234567",
+		"-generated-at", "2026-08-20T07:30:00Z",
+		"-out", out,
+	}
+
+	originalReserve := reserveOutputDirectory
+	t.Cleanup(func() { reserveOutputDirectory = originalReserve })
+	reserveOutputDirectory = func(path string) error {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sentinel, []byte("concurrent owner"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return originalReserve(path)
+	}
+	if err := run(args); err == nil {
+		t.Fatal("concurrently created output accepted")
+	}
+	if got := string(readFile(t, sentinel)); got != "concurrent owner" {
+		t.Fatalf("concurrent output modified: %q", got)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "assets" {
+		t.Fatalf("unexpected paths after reservation failure: %v", entries)
+	}
+}
+
+func TestRunCleansReservedOutputAfterAssetMoveFailureAndCanRetry(t *testing.T) {
+	root, _ := makeGitRoot(t)
+	parent := t.TempDir()
+	out := filepath.Join(parent, "assets")
+	args := []string{
+		"-root", root,
+		"-release", "v0.1.0",
+		"-source-commit", "0123456789abcdef0123456789abcdef01234567",
+		"-generated-at", "2026-08-20T07:30:00Z",
+		"-out", out,
+	}
+
+	originalMove := moveReleaseAsset
+	t.Cleanup(func() { moveReleaseAsset = originalMove })
+	moves := 0
+	moveReleaseAsset = func(oldPath, newPath string) error {
+		moves++
+		if moves == 2 {
+			return errors.New("injected asset move failure")
+		}
+		return originalMove(oldPath, newPath)
+	}
+	if err := run(args); err == nil || !strings.Contains(err.Error(), "injected asset move failure") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Lstat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reserved output exists after move failure: %v", err)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("output or temporary directory remains after move failure: %v", entries)
+	}
+
+	moveReleaseAsset = originalMove
+	if err := run(args); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	for _, name := range []string{"checksums.txt", "index.json", "node-index-v1alpha1.schema.json"} {
+		if _, err := os.Stat(filepath.Join(out, name)); err != nil {
+			t.Fatalf("retry asset %s: %v", name, err)
+		}
+	}
+}
+
 func TestRunRejectsInvalidFlagsBeforeCreatingOutput(t *testing.T) {
 	tests := []struct {
 		name string

@@ -465,6 +465,46 @@ func TestEncodeRejectsStructuralBudgetsBeforeLargeScaleAllocation(t *testing.T) 
 	}
 }
 
+func TestEncodeRejectsTotalNodeBudgetBeforeTraversingOverflowingRegistration(t *testing.T) {
+	overBudget := fixtureIndexWithRegistrationNodeCounts(t, 1, 512)
+	var overBudgetErr error
+	allocations := testing.AllocsPerRun(3, func() {
+		_, overBudgetErr = Encode(overBudget)
+	})
+	if overBudgetErr == nil || !strings.Contains(overBudgetErr.Error(), "at most 512 nodes in total") {
+		t.Fatalf("err=%v", overBudgetErr)
+	}
+	if allocations > 100 {
+		t.Fatalf("total-node overflow allocated %.0f times before rejection", allocations)
+	}
+
+	atBudget := fixtureIndexWithRegistrationNodeCounts(t, 1, 511)
+	if _, err := Encode(atBudget); err != nil {
+		t.Fatalf("exactly 512 nodes rejected: %v", err)
+	}
+}
+
+func fixtureIndexWithRegistrationNodeCounts(t *testing.T, counts ...int) Index {
+	t.Helper()
+	input := fixtureGenerateInput()
+	input.Submissions = input.Submissions[:1]
+	index, err := Generate(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modulePath := index.Packages[0].Name
+	registrations := make([]Registration, len(counts))
+	for i, count := range counts {
+		nodes := make([]NodeRef, count)
+		for j := range nodes {
+			nodes[j] = NodeRef{Type: fmt.Sprintf("node.%d.%d", i, j), Version: "1"}
+		}
+		registrations[i] = Registration{Package: fmt.Sprintf("%s/p%d", modulePath, i), Nodes: nodes}
+	}
+	index.Packages[0].Versions[0].Manifest.Registrations = registrations
+	return index
+}
+
 func fixtureGenerateInput() GenerateInput {
 	aOld := fixtureSubmission("github.com/example/a-nodes", "v1.9.0")
 	aOld.Categories = []string{"search", "integration"}

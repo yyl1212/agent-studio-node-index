@@ -622,6 +622,8 @@ func validateManifest(value Submission) error {
 }
 
 func validateRegistrations(modulePath string, registrations []Registration) error {
+	const maxTotalNodes = 512
+
 	type nodeIdentity struct {
 		Type    string
 		Version string
@@ -634,13 +636,16 @@ func validateRegistrations(modulePath string, registrations []Registration) erro
 	seenNodes := make(map[nodeIdentity]struct{})
 	for i, registration := range registrations {
 		field := fmt.Sprintf("manifest.registrations[%d]", i)
-		if !codePointLength(registration.Package, 1, 512) || module.CheckImportPath(registration.Package) != nil || (registration.Package != modulePath && !strings.HasPrefix(registration.Package, modulePath+"/")) {
-			return fmt.Errorf("%s.package must be a valid import path within the submitted module", field)
-		}
 		if len(registration.Nodes) < 1 || len(registration.Nodes) > 512 {
 			return fmt.Errorf("%s.nodes must contain 1..512 values", field)
 		}
+		if len(registration.Nodes) > maxTotalNodes-totalNodes {
+			return fmt.Errorf("manifest.registrations nodes must contain at most %d nodes in total", maxTotalNodes)
+		}
 		totalNodes += len(registration.Nodes)
+		if !codePointLength(registration.Package, 1, 512) || module.CheckImportPath(registration.Package) != nil || (registration.Package != modulePath && !strings.HasPrefix(registration.Package, modulePath+"/")) {
+			return fmt.Errorf("%s.package must be a valid import path within the submitted module", field)
+		}
 		for j, node := range registration.Nodes {
 			nodeField := fmt.Sprintf("%s.nodes[%d]", field, j)
 			if !codePointLength(node.Type, 1, 256) {
@@ -655,9 +660,6 @@ func validateRegistrations(modulePath string, registrations []Registration) erro
 			}
 			seenNodes[key] = struct{}{}
 		}
-	}
-	if totalNodes > 512 {
-		return errors.New("manifest.registrations nodes must contain at most 512 nodes in total")
 	}
 	return nil
 }
