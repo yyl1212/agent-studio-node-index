@@ -2,10 +2,117 @@ package indexgen
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestReleaseRequiresStableCurrentVersion(t *testing.T) {
+	input := fixtureReleaseInput()
+	assets, err := BuildReleaseAssets(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var index Index
+	if err := json.Unmarshal(assets["index.json"], &index); err != nil {
+		t.Fatal(err)
+	}
+	if index.Metadata.Release != input.GenerateInput.Release {
+		t.Fatalf("release=%q, want current release %q", index.Metadata.Release, input.GenerateInput.Release)
+	}
+
+	for _, release := range []string{"v1.2", "v1.2.3-rc.1", "v1.2.3+build"} {
+		t.Run(release, func(t *testing.T) {
+			input := fixtureReleaseInput()
+			input.GenerateInput.Release = release
+			if _, err := BuildReleaseAssets(input); err == nil || !strings.Contains(err.Error(), "stable full SemVer") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestReleaseRejectsInvalidSourceCommit(t *testing.T) {
+	for _, sourceCommit := range []string{"bad", strings.Repeat("A", 40), strings.Repeat("0", 39)} {
+		t.Run(sourceCommit, func(t *testing.T) {
+			input := fixtureReleaseInput()
+			input.GenerateInput.SourceCommit = sourceCommit
+			if _, err := BuildReleaseAssets(input); err == nil || !strings.Contains(err.Error(), "source commit") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestReleaseAssetsAreDeterministicAndExact(t *testing.T) {
+	first, err := BuildReleaseAssets(fixtureReleaseInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := BuildReleaseAssets(fixtureReleaseInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := make([]string, 0, len(first))
+	for name := range first {
+		keys = append(keys, name)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(keys, []string{"checksums.txt", "index.json", "node-index-v1alpha1.schema.json"}) {
+		t.Fatalf("asset names=%v", keys)
+	}
+	for _, name := range keys {
+		if !bytes.Equal(first[name], second[name]) {
+			t.Fatalf("%s is not byte deterministic", name)
+		}
+	}
+}
+
+func TestReleaseChecksumsDetectAssetMismatch(t *testing.T) {
+	assets, err := BuildReleaseAssets(fixtureReleaseInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mismatch := releaseChecksumMismatch(assets); mismatch != "" {
+		t.Fatalf("generated checksum mismatch: %s", mismatch)
+	}
+
+	tampered := make(map[string][]byte, len(assets))
+	for name, data := range assets {
+		tampered[name] = slices.Clone(data)
+	}
+	tampered["index.json"][0] ^= 1
+	if mismatch := releaseChecksumMismatch(tampered); mismatch != "index.json" {
+		t.Fatalf("mismatch=%q, want index.json", mismatch)
+	}
+}
+
+func releaseChecksumMismatch(assets map[string][]byte) string {
+	lines := strings.Split(strings.TrimSuffix(string(assets["checksums.txt"]), "\n"), "\n")
+	if len(lines) != 2 {
+		return "checksums.txt"
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return "checksums.txt"
+		}
+		data, exists := assets[fields[1]]
+		if !exists {
+			return fields[1]
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != fields[0] {
+			return fields[1]
+		}
+	}
+	return ""
+}
 
 func TestBuildReleaseAssetsProducesExactAssetsAndChecksums(t *testing.T) {
 	input := fixtureReleaseInput()

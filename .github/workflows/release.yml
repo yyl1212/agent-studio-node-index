@@ -1,0 +1,419 @@
+name: Release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build verified release assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+
+      - name: Validate release history
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! jq -e '.created == true and .deleted == false and .forced == false' "$GITHUB_EVENT_PATH" >/dev/null; then
+            echo "release tags must be newly created and must never be reused" >&2
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "$GITHUB_REF_NAME")" != "tag" ]]; then
+            echo "release ref must be an annotated Tag" >&2
+            exit 1
+          fi
+
+          head_commit=$(git rev-parse HEAD)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$head_commit" != "$tag_commit" ]]; then
+            echo "checkout HEAD does not match the release Tag commit" >&2
+            exit 1
+          fi
+
+          release_probe=$(mktemp "$RUNNER_TEMP/release-probe.XXXXXX")
+          release_tags=$(mktemp "$RUNNER_TEMP/release-tags.XXXXXX")
+          semver_checker=$(mktemp "$RUNNER_TEMP/release-semver.XXXXXX.go")
+          trap 'rm -f "$release_probe" "$release_tags" "$semver_checker"' EXIT
+
+          if gh api --include \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            -H "X-GitHub-Api-Version: 2026-03-10" >"$release_probe" 2>&1; then
+            echo "a Release already exists for $GITHUB_REF_NAME" >&2
+            exit 1
+          elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_probe"; then
+            cat "$release_probe" >&2
+            echo "unable to prove that the Release does not exist" >&2
+            exit 1
+          fi
+
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            >"$release_tags"
+
+          cat >"$semver_checker" <<'GO'
+          package main
+
+          import (
+            "bufio"
+            "fmt"
+            "os"
+            "strings"
+
+            "golang.org/x/mod/semver"
+          )
+
+          func stableFull(version string) bool {
+            return semver.IsValid(version) && semver.Canonical(version) == version && semver.Prerelease(version) == "" && semver.Build(version) == ""
+          }
+
+          func main() {
+            current := os.Args[1]
+            if !stableFull(current) {
+              fmt.Fprintf(os.Stderr, "%s is not stable full SemVer\n", current)
+              os.Exit(1)
+            }
+            previous := ""
+            scanner := bufio.NewScanner(os.Stdin)
+            for scanner.Scan() {
+              candidate := strings.TrimSpace(scanner.Text())
+              if !stableFull(candidate) {
+                continue
+              }
+              if previous == "" || semver.Compare(candidate, previous) > 0 {
+                previous = candidate
+              }
+            }
+            if err := scanner.Err(); err != nil {
+              fmt.Fprintln(os.Stderr, err)
+              os.Exit(1)
+            }
+            if previous != "" && semver.Compare(previous, current) >= 0 {
+              fmt.Fprintf(os.Stderr, "current release %s must be greater than previous release %s\n", current, previous)
+              os.Exit(1)
+            }
+            fmt.Print(previous)
+          }
+          GO
+
+          previous_tag=$(CGO_ENABLED=0 go run "$semver_checker" "$GITHUB_REF_NAME" <"$release_tags")
+          if [[ -n "$previous_tag" ]]; then
+            previous_commit=$(git rev-parse "${previous_tag}^{commit}")
+            if ! git merge-base --is-ancestor "$previous_commit" "$tag_commit"; then
+              echo "previous complete Release Tag is not an ancestor of the current Tag" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Test and generate exact assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assert_exact_assets() {
+            local directory=$1
+            local expected actual name
+            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
+            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "unexpected Release asset set in $directory" >&2
+              printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+              return 1
+            fi
+            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
+                echo "Release asset must be a non-empty regular file: $name" >&2
+                return 1
+              fi
+            done
+          }
+
+          CGO_ENABLED=0 go test ./... -count=1
+          CGO_ENABLED=0 go vet ./...
+          CGO_ENABLED=0 go run ./cmd/indexgen \
+            -root . \
+            -release "$GITHUB_REF_NAME" \
+            -source-commit "$(git rev-parse HEAD)" \
+            -generated-at "$(git show -s --format=%cI HEAD)" \
+            -out dist
+
+          assert_exact_assets dist
+          (cd dist && sha256sum --check checksums.txt)
+
+          release=$(jq -er '.metadata.release' dist/index.json)
+          source_commit=$(jq -er '.metadata.sourceCommit' dist/index.json)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$release" != "$GITHUB_REF_NAME" ]]; then
+            echo "index release does not match the current Tag" >&2
+            exit 1
+          fi
+          if [[ "$source_commit" != "$tag_commit" ]]; then
+            echo "index source commit does not match the current Tag commit" >&2
+            exit 1
+          fi
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: |
+            dist/checksums.txt
+            dist/index.json
+            dist/node-index-v1alpha1.schema.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          include-hidden-files: false
+
+  publish:
+    name: Publish immutable stable release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Revalidate release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assert_exact_assets() {
+            local directory=$1
+            local expected actual name
+            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
+            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "unexpected Release asset set in $directory" >&2
+              return 1
+            fi
+            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
+                echo "Release asset must be a non-empty regular file: $name" >&2
+                return 1
+              fi
+            done
+          }
+
+          assert_exact_assets dist
+          (cd dist && sha256sum --check checksums.txt)
+
+          head_commit=$(git rev-parse HEAD)
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if [[ "$head_commit" != "$tag_commit" ]]; then
+            echo "publish checkout HEAD does not match the current Tag commit" >&2
+            exit 1
+          fi
+          release=$(jq -er '.metadata.release' dist/index.json)
+          source_commit=$(jq -er '.metadata.sourceCommit' dist/index.json)
+          if [[ "$release" != "$GITHUB_REF_NAME" ]]; then
+            echo "downloaded index release does not match the current Tag" >&2
+            exit 1
+          fi
+          if [[ "$source_commit" != "$tag_commit" ]]; then
+            echo "downloaded index source commit does not match the current Tag commit" >&2
+            exit 1
+          fi
+
+          release_probe=$(mktemp "$RUNNER_TEMP/release-probe.XXXXXX")
+          trap 'rm -f "$release_probe"' EXIT
+          if GITHUB_TOKEN="${{ github.token }}" gh api --include \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            -H "X-GitHub-Api-Version: 2026-03-10" >"$release_probe" 2>&1; then
+            echo "a Release appeared before publication" >&2
+            exit 1
+          elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_probe"; then
+            cat "$release_probe" >&2
+            echo "unable to revalidate that the Release does not exist" >&2
+            exit 1
+          fi
+
+          CGO_ENABLED=0 go run ./cmd/indexgen \
+            -root . \
+            -release "$GITHUB_REF_NAME" \
+            -source-commit "$tag_commit" \
+            -generated-at "$(git show -s --format=%cI HEAD)" \
+            -out expected
+          assert_exact_assets expected
+          for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+            cmp --silent "dist/$name" "expected/$name"
+          done
+
+      - name: Create draft and upload exact assets
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          assert_api_assets() {
+            local release_json=$1
+            local checksums_digest index_digest schema_digest
+            checksums_digest="sha256:$(sha256sum dist/checksums.txt | awk '{print $1}')"
+            index_digest="sha256:$(sha256sum dist/index.json | awk '{print $1}')"
+            schema_digest="sha256:$(sha256sum dist/node-index-v1alpha1.schema.json | awk '{print $1}')"
+            jq -e \
+              --arg checksums_digest "$checksums_digest" \
+              --arg index_digest "$index_digest" \
+              --arg schema_digest "$schema_digest" \
+              '
+                (.assets | length) == 3 and
+                ([.assets[].name] | sort) == ["checksums.txt", "index.json", "node-index-v1alpha1.schema.json"] and
+                all(.assets[]; (.size | type) == "number" and .size > 0 and (.digest | type) == "string" and (.digest | startswith("sha256:"))) and
+                (first(.assets[] | select(.name == "checksums.txt")).digest == $checksums_digest) and
+                (first(.assets[] | select(.name == "index.json")).digest == $index_digest) and
+                (first(.assets[] | select(.name == "node-index-v1alpha1.schema.json")).digest == $schema_digest)
+              ' "$release_json" >/dev/null
+          }
+
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Agent Studio 官方精选节点包索引 $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/checksums.txt \
+            dist/index.json \
+            dist/node-index-v1alpha1.schema.json
+
+          release_json=$(mktemp "$RUNNER_TEMP/draft-release.XXXXXX.json")
+          trap 'rm -f "$release_json"' EXIT
+          gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            >"$release_json"
+          jq -e --arg tag "$GITHUB_REF_NAME" '.draft == true and .prerelease == false and .tag_name == $tag' "$release_json" >/dev/null
+          assert_api_assets "$release_json"
+
+      - name: Download draft and compare bytes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          assert_exact_assets() {
+            local directory=$1
+            local expected actual name
+            expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
+            actual=$(find "$directory" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "unexpected downloaded draft asset set" >&2
+              return 1
+            fi
+            for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+              if [[ ! -f "$directory/$name" || -L "$directory/$name" || ! -s "$directory/$name" ]]; then
+                echo "downloaded draft asset must be a non-empty regular file: $name" >&2
+                return 1
+              fi
+            done
+          }
+
+          download_dir=$(mktemp -d "$RUNNER_TEMP/draft-assets.XXXXXX")
+          trap 'rm -rf "$download_dir"' EXIT
+          gh release download "$GITHUB_REF_NAME" \
+            --dir "$download_dir" \
+            --pattern checksums.txt \
+            --pattern index.json \
+            --pattern node-index-v1alpha1.schema.json
+          assert_exact_assets "$download_dir"
+          (cd "$download_dir" && sha256sum --check checksums.txt)
+          for name in checksums.txt index.json node-index-v1alpha1.schema.json; do
+            cmp --silent "dist/$name" "$download_dir/$name"
+          done
+
+      - name: Promote immutable stable release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest
+
+      - name: Verify immutable release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          assert_api_assets() {
+            local release_json=$1
+            local checksums_digest index_digest schema_digest
+            checksums_digest="sha256:$(sha256sum dist/checksums.txt | awk '{print $1}')"
+            index_digest="sha256:$(sha256sum dist/index.json | awk '{print $1}')"
+            schema_digest="sha256:$(sha256sum dist/node-index-v1alpha1.schema.json | awk '{print $1}')"
+            jq -e \
+              --arg checksums_digest "$checksums_digest" \
+              --arg index_digest "$index_digest" \
+              --arg schema_digest "$schema_digest" \
+              '
+                (.assets | length) == 3 and
+                ([.assets[].name] | sort) == ["checksums.txt", "index.json", "node-index-v1alpha1.schema.json"] and
+                all(.assets[]; (.size | type) == "number" and .size > 0 and (.digest | type) == "string" and (.digest | startswith("sha256:"))) and
+                (first(.assets[] | select(.name == "checksums.txt")).digest == $checksums_digest) and
+                (first(.assets[] | select(.name == "index.json")).digest == $index_digest) and
+                (first(.assets[] | select(.name == "node-index-v1alpha1.schema.json")).digest == $schema_digest)
+              ' "$release_json" >/dev/null
+          }
+
+          release_json=$(mktemp "$RUNNER_TEMP/immutable-release.XXXXXX.json")
+          trap 'rm -f "$release_json"' EXIT
+          expected_state=$(printf "false\tfalse\ttrue\t${GITHUB_REF_NAME}")
+          deadline=$((SECONDS + 60))
+          while (( SECONDS <= deadline )); do
+            state=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              --jq '[.draft,.prerelease,.immutable,.tag_name] | @tsv')
+            gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              >"$release_json"
+            if [[ "$state" == "$expected_state" ]] && assert_api_assets "$release_json"; then
+              exit 0
+            fi
+            if (( SECONDS >= deadline )); then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Release did not become immutable with the exact verified assets within 60 seconds" >&2
+          exit 1
