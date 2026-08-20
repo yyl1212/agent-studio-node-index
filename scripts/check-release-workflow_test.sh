@@ -79,6 +79,7 @@ def validate(workflow, raw_workflow)
   required_build_steps = [
     "Checkout release tag",
     "Setup Go 1.26.5",
+    "Validate release workflow regressions",
     "Validate release history",
     "Test and generate exact assets",
     "Upload verified release assets",
@@ -102,6 +103,19 @@ def validate(workflow, raw_workflow)
     assert.call(setup_go.fetch("uses", nil) == "actions/setup-go@#{SETUP_GO_SHA}", "setup-go Action SHA changed")
     assert.call(setup_go.fetch("with", nil) == {"go-version" => "1.26.5", "cache" => false}, "Go toolchain inputs changed")
   end
+
+  workflow_regression_step = build_by_name.fetch("Validate release workflow regressions")
+  assert.call(!workflow_regression_step.key?("env"), "Release regression gates must not receive a token environment")
+  assert.call(workflow_regression_step.fetch("shell", nil) == "bash", "Release regression gates must use bash")
+  assert.call(workflow_regression_step.fetch("run", "") == <<~'SH', "Release regression gate commands changed")
+    set -euo pipefail
+
+    sh scripts/check-release-workflow_test.sh
+    CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+  SH
+  regression_index = build_steps.index(workflow_regression_step)
+  upload_index = build_steps.index(build_by_name.fetch("Upload verified release assets"))
+  assert.call(regression_index && upload_index && regression_index < upload_index, "Release regression gates must precede artifact handoff")
 
   history_run = build_by_name.fetch("Validate release history").fetch("run", "")
   [
@@ -183,7 +197,7 @@ unless failures.empty?
   exit 1
 end
 
-generate_run = workflow.fetch("jobs").fetch("build").fetch("steps")[3].fetch("run")
+generate_run = workflow.fetch("jobs").fetch("build").fetch("steps").find { |step| step.fetch("name", "") == "Test and generate exact assets" }.fetch("run")
 asset_checker = generate_run[/(assert_exact_assets\(\) \{.*?\n\})\n\nCGO_ENABLED/m, 1]
 abort "unable to extract the exact asset checker" unless asset_checker
 
@@ -222,9 +236,16 @@ mutations = {
   "publish read permission" => ->(copy) { copy["jobs"]["publish"]["permissions"] = {"contents" => "read"} },
   "mutable Action ref" => ->(copy) { copy["jobs"]["build"]["steps"][0]["uses"] = "actions/checkout@v6" },
   "shallow checkout" => ->(copy) { copy["jobs"]["build"]["steps"][0]["with"]["fetch-depth"] = 1 },
-  "reused Tag accepted" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!(".created == true", ".created == false") },
-  "missing exact history gate" => ->(copy) { copy["jobs"]["build"]["steps"][2]["run"].sub!("bash scripts/release-gate.sh", ":") },
-  "missing source commit check" => ->(copy) { copy["jobs"]["build"]["steps"][3]["run"].sub!('[[ "$source_commit" != "$tag_commit" ]]', "false") },
+  "missing Release fixture gate" => ->(copy) { copy["jobs"]["build"]["steps"].find { |step| step["name"] == "Validate release workflow regressions" }["run"].sub!("sh scripts/check-release-workflow_test.sh", ":") },
+  "missing pinned actionlint gate" => ->(copy) { copy["jobs"]["build"]["steps"].find { |step| step["name"] == "Validate release workflow regressions" }["run"].sub!("CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12", ":") },
+  "Release gates after artifact handoff" => lambda do |copy|
+    steps = copy["jobs"]["build"]["steps"]
+    regression = steps.delete_at(steps.index { |step| step["name"] == "Validate release workflow regressions" })
+    steps << regression
+  end,
+  "reused Tag accepted" => ->(copy) { copy["jobs"]["build"]["steps"].find { |step| step["name"] == "Validate release history" }["run"].sub!(".created == true", ".created == false") },
+  "missing exact history gate" => ->(copy) { copy["jobs"]["build"]["steps"].find { |step| step["name"] == "Validate release history" }["run"].sub!("bash scripts/release-gate.sh", ":") },
+  "missing source commit check" => ->(copy) { copy["jobs"]["build"]["steps"].find { |step| step["name"] == "Test and generate exact assets" }["run"].sub!('[[ "$source_commit" != "$tag_commit" ]]', "false") },
   "missing exact asset check" => ->(copy) { copy["jobs"]["publish"]["steps"][3]["run"].sub!("assert_exact_assets dist", ":") },
 }
 

@@ -30,7 +30,7 @@ sha256(name + "\n" + version).json
 
 ## 4. 提交与审核
 
-1. 从最新 `master` 创建分支。
+1. 从最新 `main` 创建分支。
 2. 仅提交本次需要的 `packages/*.json` 文件；每个版本使用一个精确哈希文件名。
 3. 填写 Pull Request 模板并等待 `Validate submissions` 通过。
 4. 由 CODEOWNER 审核；后续推送会使旧批准失效，最后一次推送也需要批准，并须解决全部对话。

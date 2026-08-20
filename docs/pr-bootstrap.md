@@ -24,6 +24,7 @@ CGO_ENABLED=0 go vet ./...
 CGO_ENABLED=0 go run ./cmd/indexcheck -root .
 sh scripts/check-pr-scope_test.sh
 sh scripts/check-release-workflow_test.sh
+CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
 source_commit=$(git rev-parse HEAD)
 generated_at=$(git show -s --format=%cI HEAD)
@@ -53,7 +54,7 @@ node-index-v1alpha1.schema.json
 
 ## 普通投稿检查
 
-投稿文件名是 `name + NUL + version` 的 SHA-256，并位于 `packages/<sha256>.json`。提交前至少运行：
+投稿文件名是 `name + LF + version` 的 SHA-256，并位于 `packages/<sha256>.json`；LF 是单个 `0x0a` 字节，末尾没有额外换行。提交前至少运行：
 
 ```bash
 CGO_ENABLED=0 go run ./cmd/indexcheck -root . -changed-file packages/<sha256>.json

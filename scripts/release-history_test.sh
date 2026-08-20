@@ -81,7 +81,7 @@ FAKE_GH = <<~'RUBY_SCRIPT'
       puts JSON.generate({
         "id" => 20,
         "tag_name" => tag,
-        "target_commitish" => ENV.fetch("CURRENT_COMMIT"),
+        "target_commitish" => "main",
         "draft" => false,
         "prerelease" => false,
         "published_at" => "2026-08-20T00:00:00Z",
@@ -103,7 +103,7 @@ FAKE_GH = <<~'RUBY_SCRIPT'
     puts JSON.generate({
       "id" => 10,
       "tag_name" => tag,
-      "target_commitish" => ENV.fetch("PREVIOUS_COMMIT"),
+      "target_commitish" => "main",
       "draft" => false,
       "prerelease" => false,
     })
@@ -123,7 +123,7 @@ FAKE_GH = <<~'RUBY_SCRIPT'
   puts JSON.generate({
     "id" => tag == "v0.3.0" ? 30 : 10,
     "tag_name" => tag,
-    "target_commitish" => commit,
+      "target_commitish" => "main",
     "draft" => draft,
     "prerelease" => prerelease,
     "published_at" => published_at,

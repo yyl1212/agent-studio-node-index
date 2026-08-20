@@ -30,6 +30,14 @@ jobs:
           go-version: '1.26.5'
           cache: false
 
+      - name: Validate release workflow regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sh scripts/check-release-workflow_test.sh
+          CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
       - name: Validate release history
         shell: bash
         env:

@@ -62,6 +62,47 @@ assert_remote_annotated_tag() {
   fi
 }
 
+read_fresh_remote_main() {
+  local fetched_commit refs ref_count remote_commit remote_ref extra
+
+  # Fetch the exact branch so the commit used by merge-base is fresh and
+  # present locally. Resolve the advertised ref separately and require the two
+  # observations to agree; any drift between them fails closed.
+  git fetch --no-tags origin refs/heads/main >/dev/null
+  fetched_commit=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+  if [[ ! "$fetched_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    release_error "freshly fetched remote main did not resolve to a commit"
+    return 1
+  fi
+
+  refs=$(git ls-remote --heads origin refs/heads/main)
+  ref_count=$(printf '%s\n' "$refs" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [[ "$ref_count" != 1 ]]; then
+    release_error "remote refs/heads/main is missing or ambiguous"
+    return 1
+  fi
+  IFS=$'\t' read -r remote_commit remote_ref extra <<<"$refs"
+  if [[ ! "$remote_commit" =~ ^[0-9a-f]{40}$ || "$remote_ref" != "refs/heads/main" || -n "$extra" ]]; then
+    release_error "remote refs/heads/main is malformed"
+    return 1
+  fi
+  if [[ "$fetched_commit" != "$remote_commit" ]]; then
+    release_error "remote refs/heads/main drifted during fresh resolution"
+    return 1
+  fi
+  printf '%s\n' "$remote_commit"
+}
+
+assert_expected_commit_on_remote_main() {
+  local expected_commit=$1
+  local remote_main_commit
+  remote_main_commit=$(read_fresh_remote_main)
+  if ! git merge-base --is-ancestor "$expected_commit" "$remote_main_commit"; then
+    release_error "expected Release commit is not reachable from fresh remote main"
+    return 1
+  fi
+}
+
 assert_release_api_assets() {
   local release_json=$1
   local directory=$2

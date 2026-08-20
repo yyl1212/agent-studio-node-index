@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yyl1212/agent-studio-node-index/internal/indexgen"
 )
@@ -17,6 +20,15 @@ import (
 type recordingVerifier struct {
 	submissions []indexgen.Submission
 	err         error
+}
+
+type countingTransport struct {
+	calls int
+}
+
+func (transport *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	transport.calls++
+	return nil, errors.New("unexpected HTTP request")
 }
 
 func (verifier *recordingVerifier) Verify(_ context.Context, submission indexgen.Submission) error {
@@ -63,6 +75,200 @@ func TestIndexCheckProcessesMultipleChangedFiles(t *testing.T) {
 	}
 	if got := versions(verifier.submissions); !slices.Equal(got, []string{"v1.2.3", "v1.2.4"}) {
 		t.Fatalf("verified versions=%v", got)
+	}
+}
+
+func TestIndexCheckPreflightsEntireAggregateBeforeHTTP(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string) string
+		want    string
+	}{
+		{
+			name: "semver-equivalent duplicate",
+			prepare: func(t *testing.T, root string) string {
+				changed := writeCandidateSubmission(t, root, validCandidateBytes(t))
+				duplicate := replaceCandidate(t, validCandidateBytes(t), `"version": "v1.2.3"`, `"version": "v1.2.3+build"`)
+				writeCandidateSubmission(t, root, duplicate)
+				return changed
+			},
+			want: "duplicate",
+		},
+		{
+			name: "too many versions",
+			prepare: func(t *testing.T, root string) string {
+				var changed string
+				for i := 0; i <= indexgen.MaxVersionsPerPackage; i++ {
+					data := replaceCandidate(t, validCandidateBytes(t), `"version": "v1.2.3"`, fmt.Sprintf(`"version": "v1.3.%d"`, i))
+					path := writeCandidateSubmission(t, root, data)
+					if i == 0 {
+						changed = path
+					}
+				}
+				return changed
+			},
+			want: "versions",
+		},
+		{
+			name: "oversized unchanged file",
+			prepare: func(t *testing.T, root string) string {
+				changed := writeCandidateSubmission(t, root, validCandidateBytes(t))
+				writeCandidatePath(t, root, filepath.Join("packages", strings.Repeat("f", 64)+".json"), make([]byte, indexgen.MaxSubmissionBytes+1))
+				return changed
+			},
+			want: "size",
+		},
+		{
+			name: "duplicate tuple in unchanged file",
+			prepare: func(t *testing.T, root string) string {
+				changed := writeCandidateSubmission(t, root, validCandidateBytes(t))
+				submission, err := indexgen.ParseSubmission("fixture", validCandidateBytes(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				submission.Version = "v1.2.4"
+				submission.Manifest.Registrations[0].Nodes = append(
+					submission.Manifest.Registrations[0].Nodes,
+					submission.Manifest.Registrations[0].Nodes[0],
+				)
+				data, err := json.Marshal(submission)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeCandidatePath(t, root, filepath.Join("packages", candidateFilename(submission)), data)
+				return changed
+			},
+			want: "valid submission",
+		},
+		{
+			name: "node budget in unchanged file",
+			prepare: func(t *testing.T, root string) string {
+				changed := writeCandidateSubmission(t, root, validCandidateBytes(t))
+				submission, err := indexgen.ParseSubmission("fixture", validCandidateBytes(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				submission.Version = "v1.2.4"
+				submission.Manifest.Registrations[0].Nodes = make([]indexgen.NodeRef, 513)
+				for i := range submission.Manifest.Registrations[0].Nodes {
+					submission.Manifest.Registrations[0].Nodes[i] = indexgen.NodeRef{Type: fmt.Sprintf("node.%03d", i), Version: "1"}
+				}
+				data, err := json.Marshal(submission)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeCandidatePath(t, root, filepath.Join("packages", candidateFilename(submission)), data)
+				return changed
+			},
+			want: "valid submission",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			changed := test.prepare(t, root)
+			transport := &countingTransport{}
+			err := runIndexCheck(
+				context.Background(),
+				[]string{"-root", root, "-changed-file", changed},
+				func(string) string { return "" },
+				func(*http.Client, string) submissionVerifier {
+					return indexgen.NewGitHubVerifier(&http.Client{Transport: transport}, "")
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err=%v, want substring %q", err, test.want)
+			}
+			if transport.calls != 0 {
+				t.Fatalf("HTTP calls=%d, want zero before aggregate preflight", transport.calls)
+			}
+		})
+	}
+}
+
+func TestIndexCheckDeduplicatesChangedPathsBeforeVerification(t *testing.T) {
+	root := t.TempDir()
+	path := writeCandidateSubmission(t, root, validCandidateBytes(t))
+	verifier := &recordingVerifier{}
+	err := runIndexCheck(
+		context.Background(),
+		[]string{"-root", root, "-changed-file", path, "-changed-file", path},
+		func(string) string { return "" },
+		fixedVerifierFactory(verifier),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(verifier.submissions) != 1 {
+		t.Fatalf("verification count=%d, want 1", len(verifier.submissions))
+	}
+}
+
+type deadlineRecordingVerifier struct {
+	deadlines []time.Time
+}
+
+func (verifier *deadlineRecordingVerifier) Verify(ctx context.Context, _ indexgen.Submission) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("missing command deadline")
+	}
+	verifier.deadlines = append(verifier.deadlines, deadline)
+	return nil
+}
+
+func TestIndexCheckAppliesOneSharedThirtySecondVerificationDeadline(t *testing.T) {
+	root := t.TempDir()
+	writeCandidateSubmission(t, root, validCandidateBytes(t))
+	second := replaceCandidate(t, validCandidateBytes(t), `"version": "v1.2.3"`, `"version": "v1.2.4"`)
+	writeCandidateSubmission(t, root, second)
+	verifier := &deadlineRecordingVerifier{}
+	if err := runIndexCheck(context.Background(), []string{"-root", root}, func(string) string { return "" }, fixedVerifierFactory(verifier)); err != nil {
+		t.Fatal(err)
+	}
+	if len(verifier.deadlines) != 2 || !verifier.deadlines[0].Equal(verifier.deadlines[1]) {
+		t.Fatalf("deadlines=%v, want one shared deadline", verifier.deadlines)
+	}
+	remaining := time.Until(verifier.deadlines[0])
+	if remaining <= 0 || remaining > 30*time.Second {
+		t.Fatalf("command deadline budget=%s, want (0,30s]", remaining)
+	}
+}
+
+type slowSequenceVerifier struct {
+	calls int
+}
+
+func (verifier *slowSequenceVerifier) Verify(ctx context.Context, _ indexgen.Submission) error {
+	verifier.calls++
+	if verifier.calls == 1 {
+		select {
+		case <-time.After(40 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestIndexCheckSlowSequenceStopsAtOverallDeadline(t *testing.T) {
+	root := t.TempDir()
+	writeCandidateSubmission(t, root, validCandidateBytes(t))
+	second := replaceCandidate(t, validCandidateBytes(t), `"version": "v1.2.3"`, `"version": "v1.2.4"`)
+	writeCandidateSubmission(t, root, second)
+	verifier := &slowSequenceVerifier{}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := runIndexCheck(ctx, []string{"-root", root}, func(string) string { return "" }, fixedVerifierFactory(verifier))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	if verifier.calls != 2 || time.Since(started) > time.Second {
+		t.Fatalf("calls=%d elapsed=%s", verifier.calls, time.Since(started))
 	}
 }
 

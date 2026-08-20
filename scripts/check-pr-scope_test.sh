@@ -137,11 +137,25 @@ maintainer_run = maintainer_validation.fetch("run")
   "CGO_ENABLED=0 go vet ./...",
   "CGO_ENABLED=0 go run ./cmd/indexcheck -root \"$GITHUB_WORKSPACE/candidate\"",
   "CGO_ENABLED=0 go test ./internal/indexgen -run",
+  "sh scripts/check-release-workflow_test.sh",
+  "CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
   "CGO_ENABLED=0 go run ./cmd/indexgen",
   "diff -r",
 ].each do |required_fragment|
   assert_contract(maintainer_run.include?(required_fragment), "maintainer validation is incomplete: #{required_fragment}")
 end
+release_fixture_index = maintainer_run.index("sh scripts/check-release-workflow_test.sh")
+actionlint_index = maintainer_run.index("CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12")
+maintainer_generation_index = maintainer_run.index("CGO_ENABLED=0 go run ./cmd/indexgen")
+assert_contract(
+  release_fixture_index && actionlint_index && maintainer_generation_index &&
+    release_fixture_index < maintainer_generation_index && actionlint_index < maintainer_generation_index,
+  "maintainer Release fixture and pinned actionlint must precede candidate artifact generation",
+)
+
+external_candidate_runs = [source_run, external_generation_run].join("\n")
+assert_contract(!external_candidate_runs.include?("scripts/check-release-workflow_test.sh"), "external path must not execute the candidate Release fixture")
+assert_contract(!external_candidate_runs.include?("github.com/rhysd/actionlint/cmd/actionlint"), "external path must not execute candidate actionlint")
 
 token_steps = steps.select do |step|
   step.fetch("env", {}).values.include?("${{ github.token }}")

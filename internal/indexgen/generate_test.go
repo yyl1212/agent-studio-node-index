@@ -2,6 +2,7 @@ package indexgen
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -414,6 +415,119 @@ func TestEncodeRejectsInvalidOrOversizedIndex(t *testing.T) {
 			t.Fatalf("err=%v", err)
 		}
 	})
+}
+
+func TestEncodeRejectsOversizedIndexBeforeLargeOutputAllocation(t *testing.T) {
+	index := encodingBudgetFixture(t)
+	if size := len(referenceCanonicalEncoding(t, index)); size <= MaxIndexBytes {
+		t.Fatalf("fixture size=%d, want over %d", size, MaxIndexBytes)
+	}
+
+	var encodeErr error
+	benchmark := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			_, encodeErr = Encode(index)
+		}
+	})
+	if encodeErr == nil || !strings.Contains(encodeErr.Error(), "maximum size") {
+		t.Fatalf("err=%v", encodeErr)
+	}
+	if got := benchmark.AllocedBytesPerOp(); got >= int64(MaxIndexBytes) {
+		t.Fatalf("oversized Encode allocated %d bytes/op before rejection, want less than %d", got, MaxIndexBytes)
+	} else {
+		t.Logf("oversized Encode allocation=%d bytes/op", got)
+	}
+}
+
+func TestEncodeMatchesReferenceForEveryStringEscapeClass(t *testing.T) {
+	index, err := Generate(fixtureGenerateInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	escapes := make([]byte, 0, 64)
+	for value := byte(0); value < 0x20; value++ {
+		escapes = append(escapes, value)
+	}
+	escapes = append(escapes, []byte("\\\"/<>&界\u2028\u2029")...)
+	escapes = append(escapes, 0xff)
+	index.Packages[0].Versions[0].Manifest.Metadata.Description = string(escapes)
+	want := referenceCanonicalEncoding(t, index)
+	got, err := Encode(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("canonical encoding changed for a string escape class")
+	}
+}
+
+func TestEncodeBoundaryUnderLimitPreservesReferenceBytes(t *testing.T) {
+	full := encodingBudgetFixture(t)
+	low, high := 0, len(full.Packages)+1
+	for low+1 < high {
+		middle := low + (high-low)/2
+		candidate := full
+		candidate.Packages = full.Packages[:middle]
+		if len(referenceCanonicalEncoding(t, candidate)) <= MaxIndexBytes {
+			low = middle
+		} else {
+			high = middle
+		}
+	}
+	if low == 0 || high > len(full.Packages) {
+		t.Fatalf("fixture did not straddle encoding limit: under=%d over=%d packages=%d", low, high, len(full.Packages))
+	}
+
+	under := full
+	under.Packages = full.Packages[:low]
+	want := referenceCanonicalEncoding(t, under)
+	got, err := Encode(under)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > MaxIndexBytes || !bytes.Equal(got, want) {
+		t.Fatalf("boundary encoding size=%d want=%d exact=%t", len(got), len(want), bytes.Equal(got, want))
+	}
+
+	over := full
+	over.Packages = full.Packages[:high]
+	if _, err := Encode(over); err == nil || !strings.Contains(err.Error(), "maximum size") {
+		t.Fatalf("over-boundary err=%v", err)
+	}
+}
+
+func encodingBudgetFixture(t *testing.T) Index {
+	t.Helper()
+	input := fixtureGenerateInput()
+	input.Submissions = input.Submissions[:0]
+	description := strings.Repeat("界\u2028\"\\\n<&", 250)
+	message := strings.Repeat("界\u2028\"\\\n&", 250)
+	for i := range MaxPackages {
+		name := fmt.Sprintf("github.com/example/encoding-nodes-%04d", i)
+		submission := fixtureSubmission(name, "v1.0.0")
+		submission.Manifest.Metadata.DisplayName = "encoding \"nodes\" 界\u2028"
+		submission.Manifest.Metadata.Description = description
+		submission.Keywords = []string{"amp&ersand", "unicode-界\u2028"}
+		submission.Lifecycle = Lifecycle{Status: "deprecated", Message: message}
+		input.Submissions = append(input.Submissions, fixtureSubmissionFile(submission))
+	}
+	index, err := Generate(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return index
+}
+
+func referenceCanonicalEncoding(t *testing.T, index Index) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(canonicalIndexSlices(index)); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
 }
 
 func TestEncodeRejectsStructuralBudgetsBeforeLargeScaleAllocation(t *testing.T) {

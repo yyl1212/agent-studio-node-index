@@ -44,9 +44,11 @@
 expected=$(printf '%s\n' checksums.txt index.json node-index-v1alpha1.schema.json)
 actual=$(find . -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
 test "$actual" = "$expected"
-test -s index.json
-test -s node-index-v1alpha1.schema.json
-test -s checksums.txt
+for name in index.json node-index-v1alpha1.schema.json checksums.txt; do
+  test -f "$name"
+  test ! -L "$name"
+  test -s "$name"
+done
 sha256sum --check checksums.txt
 ```
 

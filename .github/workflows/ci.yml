@@ -95,6 +95,8 @@ jobs:
           CGO_ENABLED=0 go run ./cmd/indexcheck -root "$GITHUB_WORKSPACE/candidate"
           CGO_ENABLED=0 go test ./internal/indexgen -run '^(TestSubmissionSchemaAcceptsCanonicalSubmission|TestIndexSchemaAcceptsCanonicalIndex)$' -count=1
           sh scripts/check-pr-scope_test.sh
+          sh scripts/check-release-workflow_test.sh
+          CGO_ENABLED=0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
           generation_root=$(mktemp -d "$RUNNER_TEMP/maintainer-index.XXXXXX")
           trap 'rm -rf "$generation_root"' EXIT

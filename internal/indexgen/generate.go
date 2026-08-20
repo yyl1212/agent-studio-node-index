@@ -123,8 +123,13 @@ func Encode(index Index) ([]byte, error) {
 	if err := validateIndex(index); err != nil {
 		return nil, fmt.Errorf("index is invalid: %w", err)
 	}
+	expectedSize := canonicalJSONSize(index)
+	if expectedSize > MaxIndexBytes {
+		return nil, fmt.Errorf("index exceeds maximum size of %d bytes", MaxIndexBytes)
+	}
 	canonical := canonicalIndexSlices(index)
 	var buffer bytes.Buffer
+	buffer.Grow(expectedSize)
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetIndent("", "  ")
 	encoder.SetEscapeHTML(false)
@@ -134,6 +139,9 @@ func Encode(index Index) ([]byte, error) {
 	data := buffer.Bytes()
 	if len(data) > MaxIndexBytes {
 		return nil, fmt.Errorf("index exceeds maximum size of %d bytes", MaxIndexBytes)
+	}
+	if len(data) != expectedSize {
+		return nil, fmt.Errorf("encoded index size mismatch: preflight=%d actual=%d", expectedSize, len(data))
 	}
 	if err := rejectDuplicateObjectKeys(data); err != nil {
 		return nil, fmt.Errorf("encoded index is invalid: %w", err)

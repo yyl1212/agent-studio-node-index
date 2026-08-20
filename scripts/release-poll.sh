@@ -37,8 +37,7 @@ while true; do
   if [[ "$state" == "$expected_state" ]] &&
     jq -e \
       --argjson id "$RELEASE_ID" \
-      --arg target "$EXPECTED_COMMIT" \
-      '.id == $id and .target_commitish == $target' \
+      '.id == $id' \
       "$release_json" >/dev/null &&
     assert_release_api_assets "$release_json" "$RELEASE_DIST_DIR"; then
     # Re-resolve after the single Release API response so an observable Tag

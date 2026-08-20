@@ -66,11 +66,9 @@ cleanup_release_draft() {
         if jq -e \
           --argjson id "$cleanup_id" \
           --arg tag "$GITHUB_REF_NAME" \
-          --arg target "$EXPECTED_COMMIT" \
           '
             .id == $id and
             .tag_name == $tag and
-            .target_commitish == $target and
             .draft == true and
             .immutable != true
           ' "$cleanup_response" >/dev/null; then
@@ -115,7 +113,6 @@ gh api --method POST \
   "repos/$GITHUB_REPOSITORY/releases" \
   -H "X-GitHub-Api-Version: 2026-03-10" \
   -f tag_name="$GITHUB_REF_NAME" \
-  -f target_commitish="$EXPECTED_COMMIT" \
   -f name="$GITHUB_REF_NAME" \
   -f body="Agent Studio 官方精选节点包索引 $GITHUB_REF_NAME" \
   -F draft=true \
@@ -127,11 +124,9 @@ draft_id=$(jq -er '.id | select(type == "number" and . > 0)' "$draft_response")
 jq -e \
   --argjson id "$draft_id" \
   --arg tag "$GITHUB_REF_NAME" \
-  --arg target "$EXPECTED_COMMIT" \
   '
     .id == $id and
     .tag_name == $tag and
-    .target_commitish == $target and
     .draft == true and
     .prerelease == false and
     .immutable != true
@@ -149,11 +144,9 @@ gh api \
 jq -e \
   --argjson id "$draft_id" \
   --arg tag "$GITHUB_REF_NAME" \
-  --arg target "$EXPECTED_COMMIT" \
   '
     .id == $id and
     .tag_name == $tag and
-    .target_commitish == $target and
     .draft == true and
     .prerelease == false and
     .immutable != true
@@ -181,11 +174,9 @@ gh api \
 jq -e \
   --argjson id "$draft_id" \
   --arg tag "$GITHUB_REF_NAME" \
-  --arg target "$EXPECTED_COMMIT" \
   '
     .id == $id and
     .tag_name == $tag and
-    .target_commitish == $target and
     .draft == true and
     .prerelease == false and
     .immutable != true

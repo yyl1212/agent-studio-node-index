@@ -46,5 +46,8 @@ if [[ -s "$history_result" ]]; then
 fi
 
 # History enumeration and the previous-Tag ancestor check may take time. Resolve
-# the current remote annotated Tag once more as the last gate before creation.
+# the current remote annotated Tag once more, then prove the expected commit is
+# reachable from a freshly fetched and unambiguously advertised remote main.
+# This is the common build/publish gate and its final operation before creation.
 assert_remote_annotated_tag "$GITHUB_REF_NAME" "$EXPECTED_TAG_OBJECT" "$EXPECTED_COMMIT"
+assert_expected_commit_on_remote_main "$EXPECTED_COMMIT"

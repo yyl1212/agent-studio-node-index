@@ -9,15 +9,19 @@ import (
 	"io"
 	"net/http"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/yyl1212/agent-studio-node-index/internal/indexgen"
 )
 
 var candidatePathPattern = regexp.MustCompile(`^packages/[0-9a-f]{64}\.json$`)
+
+const indexCheckLimit = 30 * time.Second
 
 type submissionVerifier interface {
 	Verify(context.Context, indexgen.Submission) error
@@ -61,7 +65,9 @@ func runIndexCheck(ctx context.Context, args []string, getenv func(string) strin
 	if *root == "" {
 		return errors.New("-root is required")
 	}
-	if err := ctx.Err(); err != nil {
+	commandContext, cancel := context.WithTimeout(ctx, indexCheckLimit)
+	defer cancel()
+	if err := commandContext.Err(); err != nil {
 		return err
 	}
 
@@ -69,28 +75,101 @@ func runIndexCheck(ctx context.Context, args []string, getenv func(string) strin
 	if err != nil {
 		return err
 	}
-	paths := []string(changed)
+	changedPaths, err := canonicalChangedPaths(changed)
+	if err != nil {
+		return err
+	}
+	allPaths, submissions, err := preflightCandidateAggregate(commandContext, rootPath)
+	if err != nil {
+		return err
+	}
+	paths := changedPaths
 	if len(paths) == 0 {
-		paths, err = allCandidatePaths(rootPath)
-		if err != nil {
-			return err
+		paths = allPaths
+	} else {
+		for _, relativePath := range paths {
+			if _, exists := submissions[relativePath]; !exists {
+				_, err := readCandidateSubmission(rootPath, relativePath)
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("%s is not part of the candidate corpus", relativePath)
+			}
 		}
 	}
 
 	verifier := newVerifier(http.DefaultClient, getenv("GITHUB_TOKEN"))
 	for _, relativePath := range paths {
-		if err := ctx.Err(); err != nil {
+		if err := commandContext.Err(); err != nil {
 			return err
 		}
-		submission, err := readCandidateSubmission(rootPath, relativePath)
-		if err != nil {
-			return err
-		}
-		if err := verifier.Verify(ctx, submission); err != nil {
+		if err := verifier.Verify(commandContext, submissions[relativePath]); err != nil {
 			return fmt.Errorf("%s: verification failed: %w", relativePath, err)
 		}
 	}
 	return nil
+}
+
+func canonicalChangedPaths(values []string) ([]string, error) {
+	paths := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if filepath.ToSlash(value) != value || pathpkg.Clean(value) != value || !candidatePathPattern.MatchString(value) {
+			return nil, errors.New("changed file must match packages/<sha256>.json")
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		paths = append(paths, value)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func preflightCandidateAggregate(ctx context.Context, root string) ([]string, map[string]indexgen.Submission, error) {
+	paths, err := allCandidatePaths(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(paths) > indexgen.MaxPackages*indexgen.MaxVersionsPerPackage {
+		return nil, nil, fmt.Errorf("candidate corpus contains too many submission files")
+	}
+
+	submissions := make(map[string]indexgen.Submission, len(paths))
+	files := make([]indexgen.SubmissionFile, 0, len(paths))
+	preflightTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	preflightCommit := strings.Repeat("0", 40)
+	for _, relativePath := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		submission, err := readCandidateSubmission(root, relativePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		submissions[relativePath] = submission
+		files = append(files, indexgen.SubmissionFile{
+			Path:        relativePath,
+			Submission:  submission,
+			IndexCommit: preflightCommit,
+			ReviewedAt:  preflightTime,
+		})
+	}
+
+	index, err := indexgen.Generate(indexgen.GenerateInput{
+		Release:      "v0.0.0",
+		SourceCommit: preflightCommit,
+		GeneratedAt:  preflightTime,
+		Submissions:  files,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("candidate aggregate is invalid: %w", err)
+	}
+	if _, err := indexgen.Encode(index); err != nil {
+		return nil, nil, fmt.Errorf("candidate aggregate is invalid: %w", err)
+	}
+	return paths, submissions, nil
 }
 
 func validateCandidateRoot(root string) (string, error) {

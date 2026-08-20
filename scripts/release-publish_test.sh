@@ -24,11 +24,14 @@ case_names = [
   "preexisting foreign draft conflict is never adopted or deleted",
   "draft creation request has an exact typed API contract",
   "non-ancestor stable Release blocks draft creation",
+  "unmerged Tag commit blocks draft creation",
+  "missing duplicate malformed or drifting main blocks draft creation",
   "previous annotated Tag drift blocks draft creation",
   "history and assets precede draft creation",
   "post-create failure deletes the exact safe draft ID",
   "post-create cancellation deletes the exact safe draft ID",
-  "mismatched target is never deleted",
+  "Release target_commitish main is not treated as Tag proof",
+  "mismatched Tag is never deleted",
   "published Release is never deleted",
   "remote Tag drift after history blocks draft creation",
   "remote Tag drift blocks promotion",
@@ -46,6 +49,7 @@ EXPECTED_COMMIT = "a" * 40
 EXPECTED_TAG_OBJECT = "b" * 40
 PREVIOUS_COMMIT = "c" * 40
 PREVIOUS_TAG_OBJECT = "d" * 40
+REMOTE_MAIN_COMMIT = "e" * 40
 
 FAKE_GH = <<~'FAKE_GH_RUBY'
   #!/usr/bin/env ruby
@@ -87,7 +91,9 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
     {
       "id" => 42,
       "tag_name" => ENV.fetch("GITHUB_REF_NAME"),
-      "target_commitish" => ENV.fetch("EXPECTED_COMMIT"),
+      # GitHub may report the repository default branch here when the Tag
+      # already exists. The annotated Tag object is the commit authority.
+      "target_commitish" => "main",
       "draft" => draft,
       "prerelease" => false,
       "immutable" => immutable,
@@ -112,7 +118,6 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
         "api", "--method", "POST", releases_endpoint,
         "-H", "X-GitHub-Api-Version: 2026-03-10",
         "-f", "tag_name=#{ENV.fetch('GITHUB_REF_NAME')}",
-        "-f", "target_commitish=#{ENV.fetch('EXPECTED_COMMIT')}",
         "-f", "name=#{ENV.fetch('GITHUB_REF_NAME')}",
         "-f", "body=Agent Studio 官方精选节点包索引 #{ENV.fetch('GITHUB_REF_NAME')}",
         "-F", "draft=true",
@@ -144,9 +149,9 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
       if scenario == "promotion_window_drift" && state == "draft" && exact_get_count >= 2
         File.write(File.join(ENV.fetch("FAKE_STATE_DIR"), "promotion-window-drift"), "")
       end
-      if scenario == "cleanup_wrong_target"
+      if scenario == "cleanup_wrong_tag"
         value = release(draft: true, immutable: false)
-        value["target_commitish"] = "f" * 40
+        value["tag_name"] = "v9.9.9"
         puts JSON.generate(value)
       elsif scenario == "cleanup_nondraft"
         puts JSON.generate(release(draft: false, immutable: false))
@@ -174,7 +179,7 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
         puts JSON.generate({
           "id" => 10,
           "tag_name" => tag,
-          "target_commitish" => ENV.fetch("PREVIOUS_COMMIT"),
+          "target_commitish" => "main",
           "draft" => false,
           "prerelease" => false,
         })
@@ -187,7 +192,7 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
         puts JSON.generate({
           "id" => tag == "v0.3.0" ? 30 : 10,
           "tag_name" => tag,
-          "target_commitish" => tag == "v0.3.0" ? "f" * 40 : ENV.fetch("PREVIOUS_COMMIT"),
+          "target_commitish" => "main",
           "draft" => false,
           "prerelease" => false,
           "published_at" => "2026-08-20T00:00:00Z",
@@ -215,7 +220,7 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
       sleep 0.1
       exit 1
     end
-    exit 1 if ["upload_failure", "cleanup_nondraft", "cleanup_wrong_target"].include?(scenario)
+    exit 1 if ["upload_failure", "cleanup_nondraft", "cleanup_wrong_tag"].include?(scenario)
     File.write(File.join(ENV.fetch("FAKE_STATE_DIR"), "uploaded"), "")
     exit
   end
@@ -258,13 +263,24 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
   case args[0]
   when "rev-parse"
     log(args.join(" "))
-    case args.fetch(1)
+    revision = args.last
+    case revision
     when "HEAD", "#{ENV.fetch('GITHUB_REF_NAME')}^{commit}"
       puts ENV.fetch("EXPECTED_COMMIT")
     when ENV.fetch("GITHUB_REF_NAME")
       puts ENV.fetch("EXPECTED_TAG_OBJECT")
+    when "FETCH_HEAD^{commit}"
+      puts ENV.fetch("REMOTE_MAIN_COMMIT")
     else
       puts ENV.fetch("PREVIOUS_COMMIT")
+    end
+  when "fetch"
+    if args == ["fetch", "--no-tags", "origin", "refs/heads/main"]
+      log("fetch-main")
+    else
+      log("unexpected-fetch:#{args.join(' ')}")
+      warn "unexpected fake git fetch: #{args.join(' ')}"
+      exit 2
     end
   when "ls-remote"
     if args == ["ls-remote", "--tags", "origin", "refs/tags/v*"]
@@ -283,6 +299,21 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
       if scenario == "lagged_newer_release"
         puts "#{'e' * 40}\trefs/tags/v0.3.0"
         puts "#{'f' * 40}\trefs/tags/v0.3.0^{}"
+      end
+    elsif args == ["ls-remote", "--heads", "origin", "refs/heads/main"]
+      log("ls-remote-main")
+      case scenario
+      when "main_missing"
+        # No matching remote default-branch ref.
+      when "main_duplicate"
+        puts "#{ENV.fetch('REMOTE_MAIN_COMMIT')}\trefs/heads/main"
+        puts "#{'f' * 40}\trefs/heads/main"
+      when "main_malformed"
+        puts "not-an-object-id\trefs/heads/main"
+      when "main_drift"
+        puts "#{'f' * 40}\trefs/heads/main"
+      else
+        puts "#{ENV.fetch('REMOTE_MAIN_COMMIT')}\trefs/heads/main"
       end
     elsif args.join(" ").include?("refs/tags/#{ENV.fetch('GITHUB_REF_NAME')}")
       count_path = File.join(ENV.fetch("FAKE_STATE_DIR"), "current-tag-lookups")
@@ -310,6 +341,9 @@ FAKE_GIT = <<~'FAKE_GIT_RUBY'
   when "merge-base"
     log(args.join(" "))
     exit 1 if scenario == "nonancestor"
+    if scenario == "unmerged_from_main" && args == ["merge-base", "--is-ancestor", ENV.fetch("EXPECTED_COMMIT"), ENV.fetch("REMOTE_MAIN_COMMIT")]
+      exit 1
+    end
   else
     log("unexpected:#{args.join(' ')}")
     warn "unexpected fake git call: #{args.join(' ')}"
@@ -425,6 +459,7 @@ def setup_fixture(directory, fake_gh = FAKE_GH)
     "EXPECTED_TAG_OBJECT" => EXPECTED_TAG_OBJECT,
     "PREVIOUS_COMMIT" => PREVIOUS_COMMIT,
     "PREVIOUS_TAG_OBJECT" => PREVIOUS_TAG_OBJECT,
+    "REMOTE_MAIN_COMMIT" => REMOTE_MAIN_COMMIT,
     "CGO_ENABLED" => "0",
     "GOCACHE" => "/private/tmp/agent-studio-node-index-go-cache",
   }
@@ -509,6 +544,11 @@ invalid_create_requests = {
   end,
   "unknown parameter" => lambda do |source|
     mutate_script_line(source, "unknown parameter", "-f tag_name=") { |line| [line, "  -f unexpected=value \\"] }
+  end,
+  "reintroduced target_commitish" => lambda do |source|
+    mutate_script_line(source, "reintroduced target_commitish", "-f tag_name=") do |line|
+      [line, '  -f target_commitish="$EXPECTED_COMMIT" \\']
+    end
   end,
   "duplicate field" => lambda do |source|
     mutate_script_line(source, "duplicate field", "-F draft=true") { |line| [line, line] }
@@ -627,6 +667,24 @@ assert.call(!nonancestor.status.success?, "non-ancestor fixture unexpectedly suc
 assert.call(nonancestor.log.include?("git:merge-base --is-ancestor"), "publish did not check the fresh previous Tag ancestor")
 assert.call(!nonancestor.log.include?("gh:create-validated-id:"), "non-ancestor stable Release did not block draft creation")
 
+unmerged = run_case(publish_script, "unmerged_from_main")
+assert.call(!unmerged.status.success?, "Tag commit outside remote main unexpectedly succeeded")
+assert.call(unmerged.log.include?("git:fetch-main"), "publish did not freshly fetch remote main")
+assert.call(unmerged.log.include?("git:ls-remote-main"), "publish did not strictly resolve refs/heads/main")
+assert.call(
+  unmerged.log.include?("git:merge-base --is-ancestor #{EXPECTED_COMMIT} #{REMOTE_MAIN_COMMIT}"),
+  "publish did not prove the expected commit is reachable from remote main",
+)
+assert.call(!unmerged.log.include?("gh:create-validated-id:"), "unmerged Tag commit did not block draft creation")
+
+%w[main_missing main_duplicate main_malformed main_drift].each do |scenario|
+  invalid_main = run_case(publish_script, scenario)
+  assert.call(!invalid_main.status.success?, "#{scenario} fixture unexpectedly succeeded")
+  assert.call(invalid_main.log.include?("git:fetch-main"), "#{scenario} did not use a fresh main fetch")
+  assert.call(invalid_main.log.include?("git:ls-remote-main"), "#{scenario} did not resolve the exact remote main ref")
+  assert.call(!invalid_main.log.include?("gh:create-validated-id:"), "#{scenario} did not block draft creation")
+end
+
 previous_drift = run_case(publish_script, "previous_tag_drift")
 assert.call(!previous_drift.status.success?, "previous Tag drift fixture unexpectedly succeeded")
 assert.call(previous_drift.log.include?("git:ls-remote-previous"), "publish did not freshly resolve the highest previous annotated Tag")
@@ -647,9 +705,16 @@ create_index = calls.index { |line| line.start_with?("gh:create-validated-id:") 
 checksum_index = calls.index { |line| line.start_with?("sha256sum:--check") }
 compare_index = calls.index { |line| line.start_with?("cmp:") }
 history_index = calls.index("gh:exact-history-published:v0.1.0")
+main_fetch_index = calls.index("git:fetch-main")
+main_ref_index = calls.index("git:ls-remote-main")
+main_ancestor_index = calls.index("git:merge-base --is-ancestor #{EXPECTED_COMMIT} #{REMOTE_MAIN_COMMIT}")
 assert.call(create_index && checksum_index && checksum_index < create_index, "checksum validation did not precede draft creation")
 assert.call(create_index && compare_index && compare_index < create_index, "byte comparison did not precede draft creation")
 assert.call(create_index && history_index && history_index < create_index, "fresh history validation did not precede draft creation")
+assert.call(create_index && main_fetch_index && main_fetch_index < create_index, "fresh remote main fetch did not precede draft creation")
+assert.call(create_index && main_ref_index && main_ref_index < create_index, "strict remote main resolution did not precede draft creation")
+assert.call(create_index && main_ancestor_index && main_ancestor_index < create_index, "remote main ancestry proof did not precede draft creation")
+assert.call(main_ancestor_index && create_index == main_ancestor_index + 1, "remote main ancestry proof is not the final observable gate before draft creation")
 assert.call(!ordered.log.include?("gh:delete-id:"), "successful publication left cleanup armed")
 assert.call(ordered.log.include?("gh:create-validated-id:42"), "draft POST fields were not validated by the GitHub boundary fake")
 assert.call(ordered.log.include?("gh:edit-validated:"), "promotion fields were not validated by the GitHub boundary fake")
@@ -669,10 +734,10 @@ assert.call(!cancelled.status.success?, "post-create cancellation fixture unexpe
 assert.call(cancelled.log.include?("gh:get-id:42"), "cancellation cleanup did not fetch the exact draft ID")
 assert.call(cancelled.log.include?("gh:delete-id:42"), "cancellation cleanup did not delete the exact safe draft ID")
 
-wrong_target = run_case(publish_script, "cleanup_wrong_target")
-assert.call(!wrong_target.status.success?, "wrong-target cleanup fixture unexpectedly succeeded")
-assert.call(wrong_target.log.include?("gh:get-id:42"), "cleanup did not inspect the wrong-target Release")
-assert.call(!wrong_target.log.include?("gh:delete-id:"), "cleanup deleted a draft with the wrong target")
+wrong_tag = run_case(publish_script, "cleanup_wrong_tag")
+assert.call(!wrong_tag.status.success?, "wrong-Tag cleanup fixture unexpectedly succeeded")
+assert.call(wrong_tag.log.include?("gh:get-id:42"), "cleanup did not inspect the wrong-Tag Release")
+assert.call(!wrong_tag.log.include?("gh:delete-id:"), "cleanup deleted a draft with the wrong Tag")
 
 nondraft = run_case(publish_script, "cleanup_nondraft")
 assert.call(!nondraft.status.success?, "non-draft cleanup fixture unexpectedly succeeded")
