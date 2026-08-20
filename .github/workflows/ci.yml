@@ -1,0 +1,107 @@
+name: CI
+
+'on':
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-submissions:
+    name: Validate submissions
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout trusted validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout candidate as data
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.5'
+          cache: false
+
+      - name: Verify external submission sources
+        if: github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login != 'yyl1212')
+        shell: bash
+        working-directory: trusted
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          candidate_root="$GITHUB_WORKSPACE/candidate"
+          changed_paths_file=$(mktemp "$RUNNER_TEMP/changed-files.XXXXXX")
+          trap 'rm -f "$changed_paths_file"' EXIT
+
+          if ! git -C "$candidate_root" diff --quiet --no-renames --diff-filter=D HEAD^1..HEAD --; then
+            echo "external submissions must not delete files" >&2
+            exit 1
+          fi
+          git -C "$candidate_root" diff --name-only -z --no-renames HEAD^1..HEAD -- > "$changed_paths_file"
+
+          indexcheck_args=()
+          while IFS= read -r -d '' changed_file; do
+            ./scripts/check-pr-scope.sh "$changed_file"
+            indexcheck_args+=("-changed-file" "$changed_file")
+          done < "$changed_paths_file"
+
+          CGO_ENABLED=0 go run ./cmd/indexcheck -root "$GITHUB_WORKSPACE/candidate" "${indexcheck_args[@]}"
+
+      - name: Generate external candidate index from trusted code
+        if: github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login != 'yyl1212')
+        shell: bash
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+
+          generation_root=$(mktemp -d "$RUNNER_TEMP/external-index.XXXXXX")
+          trap 'rm -rf "$generation_root"' EXIT
+          source_commit=$(git -C "$GITHUB_WORKSPACE/candidate" rev-parse HEAD)
+
+          CGO_ENABLED=0 go run ./cmd/indexgen \
+            -root "$GITHUB_WORKSPACE/candidate" \
+            -release v0.0.0 \
+            -source-commit "$source_commit" \
+            -generated-at 2000-01-01T00:00:00Z \
+            -out "$generation_root/index"
+
+      - name: Validate trusted maintainer candidate
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'yyl1212'
+        shell: bash
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+
+          CGO_ENABLED=0 go test ./... -count=1
+          CGO_ENABLED=0 go vet ./...
+          CGO_ENABLED=0 go run ./cmd/indexcheck -root "$GITHUB_WORKSPACE/candidate"
+          CGO_ENABLED=0 go test ./internal/indexgen -run '^(TestSubmissionSchemaAcceptsCanonicalSubmission|TestIndexSchemaAcceptsCanonicalIndex)$' -count=1
+          sh scripts/check-pr-scope_test.sh
+
+          generation_root=$(mktemp -d "$RUNNER_TEMP/maintainer-index.XXXXXX")
+          trap 'rm -rf "$generation_root"' EXIT
+          source_commit=$(git rev-parse HEAD)
+          generation_args=(
+            -root "$GITHUB_WORKSPACE/candidate"
+            -release v0.0.0
+            -source-commit "$source_commit"
+            -generated-at 2000-01-01T00:00:00Z
+          )
+
+          CGO_ENABLED=0 go run ./cmd/indexgen "${generation_args[@]}" -out "$generation_root/first"
+          CGO_ENABLED=0 go run ./cmd/indexgen "${generation_args[@]}" -out "$generation_root/second"
+          diff -r "$generation_root/first" "$generation_root/second"
