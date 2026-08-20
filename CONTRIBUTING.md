@@ -37,4 +37,10 @@ sha256(name + "\n" + version).json
 
 维护者批准的含义仅为“已收录/已审核元数据”：它表示来源固定信息、清单副本和索引字段已经过自动校验与人工审阅。它不表示节点包代码已经过安全审计，也不构成对代码、依赖、许可证、可用性或运行行为的安全保证。使用者仍需根据自己的威胁模型审查上游仓库及其依赖。
 
+## 5. 单维护者治理边界
+
+仓库当前只有一个 CODEOWNER 和管理员 `yyl1212`。普通及外部贡献者仍须满足一次批准、CODEOWNER 审核、旧批准失效、最后推送批准、全部对话解决和 `Validate submissions` 检查。为避免唯一管理员无法批准自己的 PR，branch protection 不对管理员强制执行；因此管理员能够绕过这些保护，这是明确接受的单维护者安全成本。
+
+管理员绕过时必须手工确认 trusted `pull_request_target` 检查和全部本地验证已经通过。`yyl1212` 绝不能批准或运行 fork/外部 PR 提供的 GitHub Actions workflow，也不得 source、构建或执行其中的 shell 或 Go 代码。外部候选 checkout 只能作为数据交给默认分支中的可信验证器；如 GitHub 提示 **Approve and run workflows**，必须拒绝，而不是授权候选 workflow。
+
 疑似恶意节点包或安全漏洞不要在公开 Pull Request 中披露，请按 [SECURITY.md](SECURITY.md) 私下报告。普通的元数据拼写、分类、生命周期或来源固定信息修正可以提交 Pull Request。

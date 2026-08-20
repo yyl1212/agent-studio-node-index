@@ -1,7 +1,7 @@
 name: CI
 
 'on':
-  pull_request:
+  pull_request_target:
 
 permissions:
   contents: read
@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout candidate as data
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
@@ -35,7 +35,7 @@ jobs:
           cache: false
 
       - name: Verify external submission sources
-        if: github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login != 'yyl1212')
+        if: github.event_name == 'pull_request_target' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor != 'yyl1212')
         shell: bash
         working-directory: trusted
         env:
@@ -62,7 +62,7 @@ jobs:
           CGO_ENABLED=0 go run ./cmd/indexcheck -root "$GITHUB_WORKSPACE/candidate" "${indexcheck_args[@]}"
 
       - name: Generate external candidate index from trusted code
-        if: github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login != 'yyl1212')
+        if: github.event_name == 'pull_request_target' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor != 'yyl1212')
         shell: bash
         working-directory: trusted
         run: |
@@ -71,16 +71,19 @@ jobs:
           generation_root=$(mktemp -d "$RUNNER_TEMP/external-index.XXXXXX")
           trap 'rm -rf "$generation_root"' EXIT
           source_commit=$(git -C "$GITHUB_WORKSPACE/candidate" rev-parse HEAD)
+          generation_args=(
+            -root "$GITHUB_WORKSPACE/candidate"
+            -release v0.0.0
+            -source-commit "$source_commit"
+            -generated-at 2000-01-01T00:00:00Z
+          )
 
-          CGO_ENABLED=0 go run ./cmd/indexgen \
-            -root "$GITHUB_WORKSPACE/candidate" \
-            -release v0.0.0 \
-            -source-commit "$source_commit" \
-            -generated-at 2000-01-01T00:00:00Z \
-            -out "$generation_root/index"
+          CGO_ENABLED=0 go run ./cmd/indexgen "${generation_args[@]}" -out "$generation_root/first"
+          CGO_ENABLED=0 go run ./cmd/indexgen "${generation_args[@]}" -out "$generation_root/second"
+          diff -r "$generation_root/first" "$generation_root/second"
 
       - name: Validate trusted maintainer candidate
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'yyl1212'
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && github.actor == 'yyl1212'
         shell: bash
         working-directory: candidate
         run: |

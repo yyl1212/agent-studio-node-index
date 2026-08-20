@@ -36,9 +36,10 @@ require "json"
 require "yaml"
 
 root = ARGV.fetch(0)
+$contract_failures = []
 
 def assert_contract(condition, message)
-  raise message unless condition
+  $contract_failures << message unless condition
 end
 
 workflow_path = File.join(root, ".github", "workflows", "ci.yml")
@@ -49,8 +50,7 @@ workflow = YAML.safe_load(
   aliases: false,
 )
 
-assert_contract(workflow.fetch("on").keys == ["pull_request"], "CI must only use pull_request")
-assert_contract(!workflow.fetch("on").key?("pull_request_target"), "pull_request_target is forbidden")
+assert_contract(workflow.fetch("on").keys == ["pull_request_target"], "CI must use only the trusted pull_request_target control plane")
 assert_contract(workflow.fetch("permissions") == {"contents" => "read"}, "CI permissions must be contents: read only")
 
 job = workflow.fetch("jobs").fetch("validate-submissions")
@@ -71,7 +71,7 @@ assert_contract(trusted_checkout.fetch("with") == {
 }, "trusted checkout inputs changed")
 
 candidate_checkout = steps_by_name.fetch("Checkout candidate as data")
-assert_contract(candidate_checkout.fetch("if") == "github.event_name == 'pull_request'", "candidate checkout guard changed")
+assert_contract(candidate_checkout.fetch("if") == "github.event_name == 'pull_request_target'", "candidate checkout guard must match the trusted event")
 assert_contract(candidate_checkout.fetch("uses") == "actions/checkout@#{checkout_sha}", "candidate checkout is not pinned")
 assert_contract(candidate_checkout.fetch("with") == {
   "ref" => "refs/pull/${{ github.event.pull_request.number }}/merge",
@@ -87,8 +87,8 @@ steps.select { |step| step.key?("uses") }.each do |step|
   assert_contract(step.fetch("uses").match?(/@[0-9a-f]{40}\z/), "an action is not pinned to a commit: #{step.fetch('name')}")
 end
 
-external_condition = "github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login != 'yyl1212')"
-maintainer_condition = "github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'yyl1212'"
+external_condition = "github.event_name == 'pull_request_target' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor != 'yyl1212')"
+maintainer_condition = "github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && github.actor == 'yyl1212'"
 
 source_verification = steps_by_name.fetch("Verify external submission sources")
 assert_contract(source_verification.fetch("if") == external_condition, "external verification identity guard changed")
@@ -115,8 +115,12 @@ external_generation = steps_by_name.fetch("Generate external candidate index fro
 assert_contract(external_generation.fetch("if") == external_condition, "external generation identity guard changed")
 assert_contract(external_generation.fetch("working-directory") == "trusted", "external generation must execute trusted code")
 assert_contract(!external_generation.key?("env"), "external generation must not receive a token environment")
-assert_contract(external_generation.fetch("run").include?("CGO_ENABLED=0 go run ./cmd/indexgen"), "external generation must use trusted indexgen")
-assert_contract(external_generation.fetch("run").include?("-root \"$GITHUB_WORKSPACE/candidate\""), "external generation must treat candidate as data root")
+external_generation_run = external_generation.fetch("run")
+assert_contract(external_generation_run.scan("CGO_ENABLED=0 go run ./cmd/indexgen").length == 2, "external generation must run trusted indexgen exactly twice")
+assert_contract(external_generation_run.include?("-root \"$GITHUB_WORKSPACE/candidate\""), "external generation must treat candidate as data root")
+assert_contract(external_generation_run.include?("-out \"$generation_root/first\""), "external generation first output is missing")
+assert_contract(external_generation_run.include?("-out \"$generation_root/second\""), "external generation second output is missing")
+assert_contract(external_generation_run.include?("diff -r \"$generation_root/first\" \"$generation_root/second\""), "external generation outputs must be byte-compared")
 
 maintainer_validation = steps_by_name.fetch("Validate trusted maintainer candidate")
 assert_contract(maintainer_validation.fetch("if") == maintainer_condition, "maintainer identity guard changed")
@@ -150,9 +154,14 @@ assert_contract(reviews.fetch("dismiss_stale_reviews") == true, "stale reviews m
 assert_contract(reviews.fetch("require_last_push_approval") == true, "last-push approval is required")
 assert_contract(protection.fetch("required_conversation_resolution") == true, "conversation resolution is required")
 assert_contract(protection.fetch("required_linear_history") == true, "linear history is required")
-assert_contract(protection.fetch("enforce_admins") == true, "admin enforcement is required")
+assert_contract(protection.fetch("enforce_admins") == false, "single-maintainer governance must permit the administrator bypass")
 assert_contract(protection.fetch("allow_force_pushes") == false, "force pushes must be disabled")
 assert_contract(protection.fetch("allow_deletions") == false, "branch deletion must be disabled")
+
+unless $contract_failures.empty?
+  $contract_failures.each { |message| warn "contract violation: #{message}" }
+  exit 1
+end
 RUBY
 
 printf 'PR scope and governance contract tests passed\n'
