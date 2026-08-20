@@ -264,6 +264,92 @@ func TestGitHubVerifierPreservesClientDeadline(t *testing.T) {
 	}
 }
 
+func TestGitHubVerifierPreservesCancellationAndDeadlineWhileReadingBody(t *testing.T) {
+	tests := []struct {
+		name string
+		kind error
+	}{
+		{name: "canceled", kind: context.Canceled},
+		{name: "deadline", kind: context.DeadlineExceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: &errorReadCloser{err: fmt.Errorf(
+						"remote-body secret-token: %w", test.kind,
+					)},
+					Request: request,
+				}, nil
+			})
+			submission, _, _ := validPinnedFixture(t)
+			err := NewGitHubVerifier(&http.Client{Transport: transport}, "secret-token").Verify(context.Background(), submission)
+			if !errors.Is(err, test.kind) {
+				t.Fatalf("err=%v", err)
+			}
+			if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "remote-body") {
+				t.Fatalf("unsafe err=%v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyUsesOneBoundedDeadlineAcrossRequests(t *testing.T) {
+	var deadlines []time.Time
+	requestCount := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		if !ok {
+			return nil, errors.New("request has no deadline")
+		}
+		deadlines = append(deadlines, deadline)
+		requestCount++
+		if requestCount == 1 {
+			time.Sleep(5 * time.Millisecond)
+			return responseFor(request, http.StatusOK, `{"object":{"type":"commit","sha":"`+fixtureCommit+`"}}`), nil
+		}
+		return nil, errors.New("stop after observing second deadline")
+	})
+	submission, _, _ := validPinnedFixture(t)
+	started := time.Now()
+	_ = NewGitHubVerifier(&http.Client{Transport: transport}, "").Verify(context.Background(), submission)
+	if len(deadlines) != 2 {
+		t.Fatalf("deadlines=%v", deadlines)
+	}
+	if !deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("per-request deadlines differ: %s != %s", deadlines[0], deadlines[1])
+	}
+	remaining := deadlines[0].Sub(started)
+	if remaining <= 0 || remaining > githubVerifierLimit+50*time.Millisecond {
+		t.Fatalf("total deadline remaining=%s", remaining)
+	}
+}
+
+func TestVerifyHonorsEarlierCallerDeadlineAcrossRequests(t *testing.T) {
+	requestCount := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		if requestCount == 1 {
+			return responseFor(request, http.StatusOK, `{"object":{"type":"commit","sha":"`+fixtureCommit+`"}}`), nil
+		}
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	submission, _, _ := validPinnedFixture(t)
+	started := time.Now()
+	err := NewGitHubVerifier(&http.Client{Transport: transport}, "").Verify(ctx, submission)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	if requestCount != 2 || time.Since(started) > time.Second {
+		t.Fatalf("request count=%d elapsed=%s", requestCount, time.Since(started))
+	}
+}
+
 func TestGitHubVerifierCopiesClientBoundsTimeoutAndScopesAuthorization(t *testing.T) {
 	transport := &recordingTransport{}
 	originalRedirect := func(*http.Request, []*http.Request) error { return errors.New("original") }
@@ -306,6 +392,84 @@ func TestGitHubVerifierCopiesClientBoundsTimeoutAndScopesAuthorization(t *testin
 	}
 }
 
+func TestGitHubVerifierComposesCallerRedirectPolicyWithoutExposingToken(t *testing.T) {
+	policyCalls := 0
+	policySawAuthorization := false
+	policy := func(request *http.Request, via []*http.Request) error {
+		policyCalls++
+		policySawAuthorization = requestGraphHasAuthorization(request, 0)
+		for _, previous := range via {
+			policySawAuthorization = policySawAuthorization || requestGraphHasAuthorization(previous, 0)
+		}
+		return errors.New("caller policy rejected redirect containing secret-token")
+	}
+	transportCalls := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		transportCalls++
+		if transportCalls == 1 {
+			return redirectResponse(request, "https://api.github.com/redirected"), nil
+		}
+		return nil, errors.New("redirect unexpectedly reached transport")
+	})
+	submission, _, _ := validPinnedFixture(t)
+	err := NewGitHubVerifier(&http.Client{Transport: transport, CheckRedirect: policy}, "secret-token").Verify(context.Background(), submission)
+	if err == nil {
+		t.Fatal("caller redirect rejection was ignored")
+	}
+	if policyCalls != 1 || transportCalls != 1 {
+		t.Fatalf("policy calls=%d transport calls=%d", policyCalls, transportCalls)
+	}
+	if policySawAuthorization || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("token exposed to policy or error: saw authorization=%v err=%v", policySawAuthorization, err)
+	}
+}
+
+func TestGitHubVerifierKeepsDefaultTenRedirectLimit(t *testing.T) {
+	transportCalls := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		transportCalls++
+		if transportCalls > 10 {
+			return nil, errors.New("more than ten requests followed")
+		}
+		return redirectResponse(request, fmt.Sprintf("https://api.github.com/redirect/%d", transportCalls)), nil
+	})
+	submission, _, _ := validPinnedFixture(t)
+	err := NewGitHubVerifier(&http.Client{Transport: transport}, "").Verify(context.Background(), submission)
+	if err == nil {
+		t.Fatal("redirect loop was accepted")
+	}
+	if transportCalls != 10 {
+		t.Fatalf("transport calls=%d, want 10", transportCalls)
+	}
+}
+
+func TestGitHubVerifierRejectsExternalRedirectBeforeCallerPolicy(t *testing.T) {
+	policyCalls := 0
+	policy := func(*http.Request, []*http.Request) error {
+		policyCalls++
+		return nil
+	}
+	transportCalls := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		transportCalls++
+		if transportCalls > 1 {
+			return nil, errors.New("external redirect reached transport")
+		}
+		return redirectResponse(request, "https://example.com/stolen"), nil
+	})
+	submission, _, _ := validPinnedFixture(t)
+	err := NewGitHubVerifier(&http.Client{Transport: transport, CheckRedirect: policy}, "secret-token").Verify(context.Background(), submission)
+	if err == nil {
+		t.Fatal("external redirect was accepted")
+	}
+	if policyCalls != 0 || transportCalls != 1 {
+		t.Fatalf("policy calls=%d transport calls=%d", policyCalls, transportCalls)
+	}
+	if strings.Contains(err.Error(), "example.com") || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("unsafe err=%v", err)
+	}
+}
+
 func TestGitHubVerifierEscapesEveryPathSegment(t *testing.T) {
 	submission, manifestRaw, goModRaw := validPinnedFixture(t)
 	submission.Source.Tag = "release/v1.2.3"
@@ -319,6 +483,24 @@ func TestGitHubVerifierEscapesEveryPathSegment(t *testing.T) {
 	}
 	if got, want := transport.requests[2].URL, "https://api.github.com/repos/example/agent-nodes/contents/dir%20%3F%23%25/agent-studio.node-package.json?ref="+fixtureCommit; got != want {
 		t.Fatalf("content URL=%q, want %q", got, want)
+	}
+}
+
+func TestGitHubURLRejectsDotSegmentsAndEscapesSlashWithinSegment(t *testing.T) {
+	for _, segment := range []string{".", ".."} {
+		t.Run(segment, func(t *testing.T) {
+			if got, err := githubURL([]string{"repos", "example", segment, "value"}, nil); err == nil {
+				t.Fatalf("URL=%q, want rejection", got)
+			}
+		})
+	}
+	got, err := githubURL([]string{"repos", "example", "agent-nodes", "git", "ref", "tags", "release/v1.2.3"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://api.github.com/repos/example/agent-nodes/git/ref/tags/release%2Fv1.2.3"
+	if got != want {
+		t.Fatalf("URL=%q, want %q", got, want)
 	}
 }
 
@@ -356,6 +538,43 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type errorReadCloser struct {
+	err error
+}
+
+func (reader *errorReadCloser) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func (reader *errorReadCloser) Close() error {
+	return nil
+}
+
+func responseFor(request *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}
+}
+
+func redirectResponse(request *http.Request, location string) *http.Response {
+	response := responseFor(request, http.StatusFound, "")
+	response.Header.Set("Location", location)
+	return response
+}
+
+func requestGraphHasAuthorization(request *http.Request, depth int) bool {
+	if request == nil || depth > 10 {
+		return false
+	}
+	if request.Header.Get("Authorization") != "" {
+		return true
+	}
+	return request.Response != nil && requestGraphHasAuthorization(request.Response.Request, depth+1)
 }
 
 func setManifestDigest(submission *Submission, manifestRaw []byte) {

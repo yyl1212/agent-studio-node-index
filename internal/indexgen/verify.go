@@ -47,16 +47,59 @@ func NewGitHubVerifier(client *http.Client, token string) *GitHubVerifier {
 		transport = http.DefaultTransport
 	}
 	clientCopy.Transport = &githubTransport{base: transport, token: token}
-	clientCopy.CheckRedirect = func(request *http.Request, _ []*http.Request) error {
+	callerRedirectPolicy := clientCopy.CheckRedirect
+	clientCopy.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if err := validateGitHubTarget(request.URL); err != nil {
 			return errors.New("GitHub redirect target rejected")
 		}
-		return nil
+		if callerRedirectPolicy == nil {
+			if len(via) >= 10 {
+				return errors.New("GitHub redirect limit exceeded")
+			}
+			return nil
+		}
+		return callerRedirectPolicy(withoutAuthorization(request), requestsWithoutAuthorization(via))
 	}
 	return &GitHubVerifier{client: &clientCopy}
 }
 
+func withoutAuthorization(request *http.Request) *http.Request {
+	return withoutAuthorizationGraph(request, make(map[*http.Request]*http.Request))
+}
+
+func withoutAuthorizationGraph(request *http.Request, seen map[*http.Request]*http.Request) *http.Request {
+	if request == nil {
+		return nil
+	}
+	if existing, ok := seen[request]; ok {
+		return existing
+	}
+	requestCopy := request.Clone(request.Context())
+	seen[request] = requestCopy
+	requestCopy.Header = request.Header.Clone()
+	requestCopy.Header.Del("Authorization")
+	if request.Response != nil {
+		responseCopy := new(http.Response)
+		*responseCopy = *request.Response
+		responseCopy.Header = request.Response.Header.Clone()
+		responseCopy.Trailer = request.Response.Trailer.Clone()
+		responseCopy.Request = withoutAuthorizationGraph(request.Response.Request, seen)
+		requestCopy.Response = responseCopy
+	}
+	return requestCopy
+}
+
+func requestsWithoutAuthorization(requests []*http.Request) []*http.Request {
+	result := make([]*http.Request, len(requests))
+	for index, request := range requests {
+		result[index] = withoutAuthorization(request)
+	}
+	return result
+}
+
 func (verifier *GitHubVerifier) Verify(ctx context.Context, submission Submission) error {
+	ctx, cancel := context.WithTimeout(ctx, githubVerifierLimit)
+	defer cancel()
 	if err := validateSubmission(submission); err != nil {
 		return fmt.Errorf("invalid submission: %w", err)
 	}
@@ -126,8 +169,12 @@ type gitObject struct {
 }
 
 func (verifier *GitHubVerifier) resolveTag(ctx context.Context, owner, repo, tag string) (string, error) {
+	referenceURL, err := githubURL([]string{"repos", owner, repo, "git", "ref", "tags", tag}, nil)
+	if err != nil {
+		return "", err
+	}
 	var reference gitObject
-	if err := verifier.getJSON(ctx, githubURL([]string{"repos", owner, repo, "git", "ref", "tags", tag}, nil), "source.tag", objectResponseLimit, &reference); err != nil {
+	if err := verifier.getJSON(ctx, referenceURL, "source.tag", objectResponseLimit, &reference); err != nil {
 		return "", err
 	}
 	switch reference.Object.Type {
@@ -144,8 +191,12 @@ func (verifier *GitHubVerifier) resolveTag(ctx context.Context, owner, repo, tag
 		return "", errors.New("source.tag must resolve to a commit or annotated tag")
 	}
 
+	annotatedURL, err := githubURL([]string{"repos", owner, repo, "git", "tags", reference.Object.SHA}, nil)
+	if err != nil {
+		return "", err
+	}
 	var annotated gitObject
-	if err := verifier.getJSON(ctx, githubURL([]string{"repos", owner, repo, "git", "tags", reference.Object.SHA}, nil), "source.tag", objectResponseLimit, &annotated); err != nil {
+	if err := verifier.getJSON(ctx, annotatedURL, "source.tag", objectResponseLimit, &annotated); err != nil {
 		return "", err
 	}
 	if annotated.Object.Type != "commit" || !gitOIDPattern.MatchString(annotated.Object.SHA) {
@@ -162,8 +213,12 @@ type contentResponse struct {
 func (verifier *GitHubVerifier) content(ctx context.Context, owner, repo, filePath, commit string, maximum int64) ([]byte, error) {
 	segments := []string{"repos", owner, repo, "contents"}
 	segments = append(segments, strings.Split(filePath, "/")...)
+	contentURL, err := githubURL(segments, url.Values{"ref": []string{commit}})
+	if err != nil {
+		return nil, err
+	}
 	var response contentResponse
-	if err := verifier.getJSON(ctx, githubURL(segments, url.Values{"ref": []string{commit}}), "pinned file", maximum*2+objectResponseLimit, &response); err != nil {
+	if err := verifier.getJSON(ctx, contentURL, "pinned file", maximum*2+objectResponseLimit, &response); err != nil {
 		return nil, err
 	}
 	if response.Encoding != "base64" {
@@ -183,16 +238,19 @@ func (verifier *GitHubVerifier) content(ctx context.Context, owner, repo, filePa
 	return decoded, nil
 }
 
-func githubURL(segments []string, query url.Values) string {
+func githubURL(segments []string, query url.Values) (string, error) {
 	escaped := make([]string, len(segments))
 	for index, segment := range segments {
+		if segment == "." || segment == ".." {
+			return "", errors.New("GitHub API path segment rejected")
+		}
 		escaped[index] = url.PathEscape(segment)
 	}
 	result := "https://" + githubAPIHost + "/" + strings.Join(escaped, "/")
 	if len(query) != 0 {
 		result += "?" + query.Encode()
 	}
-	return result
+	return result, nil
 }
 
 func (verifier *GitHubVerifier) getJSON(ctx context.Context, target, field string, maximum int64, destination any) error {
@@ -220,6 +278,15 @@ func (verifier *GitHubVerifier) getJSON(ctx context.Context, target, field strin
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maximum+1))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, context.Canceled) {
+			return context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
 		return fmt.Errorf("GitHub API response could not be read for %s", field)
 	}
 	if int64(len(body)) > maximum {
