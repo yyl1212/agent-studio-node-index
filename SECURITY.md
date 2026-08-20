@@ -23,4 +23,6 @@
 
 PR 校验使用默认分支提供的只读 `pull_request_target` 控制面。外部候选 checkout 仅作为数据，由默认分支中的 scope checker、`indexcheck` 和 `indexgen` 处理；外部候选代码不得被 source、构建或执行。只有同仓库且触发者 `github.actor` 恰为 `yyl1212` 时，CI 才允许执行候选 Go 代码。
 
+固定的 checkout v7 Action 在 `pull_request_target` 下读取 fork PR merge ref 时要求 candidate checkout 显式设置 `allow-unsafe-pr-checkout: true`。这个名称反映了真实风险，该输入本身并不安全；本仓库只因 candidate 使用独立路径、`persist-credentials: false`，并且外部 candidate 永远只作数据而允许它。trusted/default-branch checkout 禁止设置该输入。若未来需要执行 candidate 内容，必须先移除此 opt-in 并重新设计信任边界，不能沿用当前配置。
+
 仓库为避免唯一 CODEOWNER/管理员的自审死锁，不对管理员强制 branch protection。普通及外部贡献者仍需要一次批准和 CODEOWNER 审核，但管理员能够绕过必需检查与审核，这是单维护者模式的已知安全成本。管理员必须在绕过前手工完成等价验证，并且绝不能批准或运行 fork/外部 PR 提供的 workflow；遇到 **Approve and run workflows** 提示时必须拒绝。

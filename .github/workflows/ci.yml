@@ -27,6 +27,7 @@ jobs:
           path: candidate
           fetch-depth: 2
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Setup Go 1.26.5
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e

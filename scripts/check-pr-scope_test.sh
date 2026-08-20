@@ -63,7 +63,9 @@ checkout_sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 setup_go_sha = "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
 trusted_checkout = steps_by_name.fetch("Checkout trusted validator")
 assert_contract(trusted_checkout.fetch("uses") == "actions/checkout@#{checkout_sha}", "trusted checkout is not pinned")
-assert_contract(trusted_checkout.fetch("with") == {
+trusted_checkout_inputs = trusted_checkout.fetch("with")
+assert_contract(!trusted_checkout_inputs.key?("allow-unsafe-pr-checkout"), "trusted checkout must never allow an unsafe PR checkout")
+assert_contract(trusted_checkout_inputs == {
   "ref" => "${{ github.event.pull_request.base.sha || github.sha }}",
   "path" => "trusted",
   "fetch-depth" => 0,
@@ -73,11 +75,14 @@ assert_contract(trusted_checkout.fetch("with") == {
 candidate_checkout = steps_by_name.fetch("Checkout candidate as data")
 assert_contract(candidate_checkout.fetch("if") == "github.event_name == 'pull_request_target'", "candidate checkout guard must match the trusted event")
 assert_contract(candidate_checkout.fetch("uses") == "actions/checkout@#{checkout_sha}", "candidate checkout is not pinned")
-assert_contract(candidate_checkout.fetch("with") == {
+candidate_checkout_inputs = candidate_checkout.fetch("with")
+assert_contract(candidate_checkout_inputs["allow-unsafe-pr-checkout"] == true, "candidate checkout must explicitly allow fork PR data checkout")
+assert_contract(candidate_checkout_inputs == {
   "ref" => "refs/pull/${{ github.event.pull_request.number }}/merge",
   "path" => "candidate",
   "fetch-depth" => 2,
   "persist-credentials" => false,
+  "allow-unsafe-pr-checkout" => true,
 }, "candidate checkout inputs changed")
 
 setup_go = steps_by_name.fetch("Setup Go 1.26.5")
