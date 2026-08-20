@@ -107,7 +107,7 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
     method = method_index ? args.fetch(method_index + 1) : "GET"
     endpoint = args.find { |arg| arg.start_with?("repos/") }
     releases_endpoint = "repos/#{ENV.fetch('GITHUB_REPOSITORY')}/releases"
-    if method == "POST" && endpoint == releases_endpoint
+    if method == "POST" && (endpoint == releases_endpoint || endpoint&.start_with?("#{releases_endpoint}?"))
       expected_arguments = [
         "api", "--method", "POST", releases_endpoint,
         "-H", "X-GitHub-Api-Version: 2026-03-10",
@@ -372,14 +372,14 @@ FAKE_CMP = <<~'SH'
   exec /usr/bin/cmp "$@"
 SH
 
-Result = Struct.new(:status, :stderr, :log, :elapsed, keyword_init: true)
+Result = Struct.new(:status, :stderr, :log, :elapsed, :state_created, keyword_init: true)
 
 def write_executable(path, content)
   File.write(path, content)
   File.chmod(0o700, path)
 end
 
-def setup_fixture(directory)
+def setup_fixture(directory, fake_gh = FAKE_GH)
   paths = %w[bin dist expected runner state].to_h { |name| [name, File.join(directory, name)] }
   paths.each_value { |path| Dir.mkdir(path) }
   index = <<~JSON
@@ -403,7 +403,7 @@ def setup_fixture(directory)
   ].join("\n") + "\n")
   FileUtils.cp_r(Dir[File.join(paths["dist"], "*")], paths["expected"])
 
-  write_executable(File.join(paths["bin"], "gh"), FAKE_GH)
+  write_executable(File.join(paths["bin"], "gh"), fake_gh)
   write_executable(File.join(paths["bin"], "git"), FAKE_GIT)
   write_executable(File.join(paths["bin"], "timeout"), FAKE_TIMEOUT)
   write_executable(File.join(paths["bin"], "sha256sum"), FAKE_SHA256SUM)
@@ -430,93 +430,119 @@ def setup_fixture(directory)
   }
 end
 
-def run_case(publish_script, scenario)
+def mutate_script_line(source, label, needle)
+  lines = source.lines
+  indexes = lines.each_index.select { |index| lines.fetch(index).include?(needle) }
+  raise "#{label}: expected exactly one production line, found #{indexes.length}" unless indexes.length == 1
+
+  replacement = Array(yield(lines.fetch(indexes.fetch(0)).chomp)).map { |line| "#{line}\n" }
+  lines[indexes.fetch(0), 1] = replacement
+  lines.join
+end
+
+def materialize_mutated_state_machine(publish_script, directory, mutator)
+  source_script_dir = File.dirname(publish_script)
+  source_root = File.dirname(source_script_dir)
+  target_root = File.join(directory, "mutated-production")
+  target_script_dir = File.join(target_root, "scripts")
+  FileUtils.mkdir_p(target_script_dir)
+  %w[release-publish.sh release-gate.sh release-lib.sh release-history.sh release-poll.sh].each do |name|
+    FileUtils.cp(File.join(source_script_dir, name), File.join(target_script_dir, name))
+  end
+  %w[cmd internal go.mod go.sum].each do |name|
+    source_path = File.join(source_root, name)
+    FileUtils.ln_s(source_path, File.join(target_root, name)) if File.exist?(source_path)
+  end
+
+  target_publish_script = File.join(target_script_dir, "release-publish.sh")
+  source = File.read(target_publish_script)
+  mutated = mutator.call(source)
+  raise "production mutation did not change release-publish.sh" if mutated == source
+  File.write(target_publish_script, mutated)
+  target_publish_script
+end
+
+def run_case(publish_script, scenario, publish_mutator: nil, fake_gh: FAKE_GH)
   Dir.mktmpdir("release-publish-behavior") do |directory|
-    environment = setup_fixture(directory)
+    environment = setup_fixture(directory, fake_gh)
     environment["FAKE_SCENARIO"] = scenario
     yield(environment) if block_given?
+    script_under_test = if publish_mutator
+      materialize_mutated_state_machine(publish_script, directory, publish_mutator)
+    else
+      publish_script
+    end
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     repository_root = File.dirname(File.dirname(publish_script))
-    _stdout, stderr, status = Open3.capture3(environment, "bash", publish_script, chdir: repository_root)
+    _stdout, stderr, status = Open3.capture3(environment, "bash", script_under_test, chdir: repository_root)
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
     log = File.file?(environment.fetch("FAKE_CALL_LOG")) ? File.read(environment.fetch("FAKE_CALL_LOG")) : ""
-    return Result.new(status: status, stderr: stderr, log: log, elapsed: elapsed)
-  end
-end
-
-def create_request_arguments(environment)
-  [
-    "api", "--method", "POST",
-    "repos/#{environment.fetch('GITHUB_REPOSITORY')}/releases",
-    "-H", "X-GitHub-Api-Version: 2026-03-10",
-    "-f", "tag_name=#{environment.fetch('GITHUB_REF_NAME')}",
-    "-f", "target_commitish=#{environment.fetch('EXPECTED_COMMIT')}",
-    "-f", "name=#{environment.fetch('GITHUB_REF_NAME')}",
-    "-f", "body=Agent Studio 官方精选节点包索引 #{environment.fetch('GITHUB_REF_NAME')}",
-    "-F", "draft=true",
-    "-F", "prerelease=false",
-    "-F", "generate_release_notes=false",
-    "-f", "make_latest=false",
-  ]
-end
-
-def exercise_create_boundary(mutator = nil)
-  Dir.mktmpdir("release-create-contract") do |directory|
-    environment = setup_fixture(directory)
-    environment["FAKE_SCENARIO"] = "success"
-    arguments = create_request_arguments(environment)
-    mutator&.call(arguments, directory)
-    _stdout, stderr, status = Open3.capture3(environment, "gh", *arguments)
-    log = File.file?(environment.fetch("FAKE_CALL_LOG")) ? File.read(environment.fetch("FAKE_CALL_LOG")) : ""
-    state_path = File.join(environment.fetch("FAKE_STATE_DIR"), "state")
-    return [status, stderr, log, File.exist?(state_path)]
+    state_created = File.file?(File.join(environment.fetch("FAKE_STATE_DIR"), "state"))
+    return Result.new(status: status, stderr: stderr, log: log, elapsed: elapsed, state_created: state_created)
   end
 end
 
 failures = []
 assert = ->(condition, message) { failures << message unless condition }
 
-valid_create_status, valid_create_stderr, valid_create_log, valid_create_state = exercise_create_boundary
-assert.call(valid_create_status.success?, "exact typed draft POST was rejected by the boundary fake: #{valid_create_stderr}")
-assert.call(valid_create_log.include?("gh:create-validated-id:42") && valid_create_state, "exact typed draft POST did not create fake state")
-
 invalid_create_requests = {
-  "raw draft boolean" => lambda do |arguments, _directory|
-    draft_index = arguments.index("draft=true")
-    arguments[draft_index - 1] = "-f"
+  "raw draft boolean" => lambda do |source|
+    mutate_script_line(source, "raw draft boolean", "-F draft=true") { |line| line.sub("-F draft=true", "-f draft=true") }
   end,
-  "raw generated-notes boolean" => lambda do |arguments, _directory|
-    generated_index = arguments.index("generate_release_notes=false")
-    arguments[generated_index - 1] = "-f"
+  "raw generated-notes boolean" => lambda do |source|
+    mutate_script_line(source, "raw generated-notes boolean", "-F generate_release_notes=false") do |line|
+      line.sub("-F generate_release_notes=false", "-f generate_release_notes=false")
+    end
   end,
-  "typed make-latest string" => lambda do |arguments, _directory|
-    latest_index = arguments.index("make_latest=false")
-    arguments[latest_index - 1] = "-F"
+  "typed make-latest string" => lambda do |source|
+    mutate_script_line(source, "typed make-latest string", "-f make_latest=false") { |line| line.sub("-f make_latest=false", "-F make_latest=false") }
   end,
-  "input body" => lambda do |arguments, directory|
-    arguments.concat(["--input", File.join(directory, "payload.json")])
+  "input body" => lambda do |source|
+    mutate_script_line(source, "input body", "-f tag_name=") do |line|
+      ['  --input "$RUNNER_TEMP/create-request.json" \\', line]
+    end
   end,
-  "query migration" => lambda do |arguments, _directory|
-    endpoint_index = arguments.index { |argument| argument.start_with?("repos/") }
-    arguments[endpoint_index] = "#{arguments.fetch(endpoint_index)}?draft=true"
+  "query migration" => lambda do |source|
+    mutate_script_line(source, "query migration", '"repos/$GITHUB_REPOSITORY/releases"') do |line|
+      line.sub('/releases"', '/releases?draft=true"')
+    end
   end,
-  "unknown option" => lambda { |arguments, _directory| arguments << "--silent" },
-  "duplicate field" => lambda { |arguments, _directory| arguments.concat(["-F", "draft=true"]) },
-  "changed body field" => lambda do |arguments, _directory|
-    body_index = arguments.index { |argument| argument.start_with?("body=") }
-    arguments[body_index] = "body=unexpected"
+  "unknown parameter" => lambda do |source|
+    mutate_script_line(source, "unknown parameter", "-f tag_name=") { |line| [line, "  -f unexpected=value \\"] }
   end,
-  "missing field" => lambda do |arguments, _directory|
-    prerelease_index = arguments.index("prerelease=false")
-    arguments.slice!(prerelease_index - 1, 2)
+  "duplicate field" => lambda do |source|
+    mutate_script_line(source, "duplicate field", "-F draft=true") { |line| [line, line] }
+  end,
+  "changed body field" => lambda do |source|
+    mutate_script_line(source, "changed body field", "-f body=") do |line|
+      line.sub('body="Agent Studio 官方精选节点包索引 $GITHUB_REF_NAME"', "body=unexpected")
+    end
+  end,
+  "missing generate-release-notes field" => lambda do |source|
+    mutate_script_line(source, "missing generate-release-notes field", "-F generate_release_notes=false") { [] }
   end,
 }
 invalid_create_requests.each do |label, mutator|
-  status, _stderr, log, state_created = exercise_create_boundary(mutator)
-  assert.call(!status.success?, "boundary fake accepted #{label}")
-  assert.call(!state_created, "boundary fake created state for #{label}")
-  assert.call(!log.include?("gh:create-validated-id:"), "boundary fake validated #{label}")
+  result = run_case(publish_script, "success", publish_mutator: mutator)
+  assert.call(!result.status.success?, "strict fake accepted production mutation: #{label}")
+  assert.call(result.log.include?("git:enumerate-tags"), "#{label} did not execute the production release state machine")
+  assert.call(result.log.include?("gh:invalid-create-arguments:"), "#{label} did not reach rejection by the strict GitHub boundary fake")
+  assert.call(!result.state_created, "strict fake created state for production mutation: #{label}")
+  assert.call(!result.log.include?("gh:create-validated-id:"), "strict fake validated production mutation: #{label}")
+  assert.call(!result.log.include?("gh:upload:") && !result.log.include?("gh:edit-validated:") && !result.log.include?("gh:delete-id:"), "#{label} crossed a forbidden release state transition")
 end
+
+weakened_fake = FAKE_GH.sub("unless args == expected_arguments", "unless true")
+raise "strict fake weakening canary did not change the fake" if weakened_fake == FAKE_GH
+canary = run_case(
+  publish_script,
+  "success",
+  publish_mutator: invalid_create_requests.fetch("raw draft boolean"),
+  fake_gh: weakened_fake,
+)
+assert.call(canary.status.success?, "strict fake weakening canary failed before the mutated POST boundary: #{canary.stderr}")
+assert.call(canary.log.include?("gh:create-validated-id:42") && canary.state_created, "strict fake weakening canary did not cross fake state creation")
+assert.call(canary.log.include?("gh:upload:") && canary.log.include?("gh:edit-validated:"), "strict fake weakening canary did not prove later release transitions were reachable")
 
 Dir.mktmpdir("release-lib-behavior") do |directory|
   environment = setup_fixture(directory)
