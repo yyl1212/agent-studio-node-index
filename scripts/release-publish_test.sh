@@ -21,6 +21,8 @@ case_names = [
   "existing Release blocks draft creation",
   "lagged newer stable Release blocks draft creation",
   "malformed or failed exact history lookup blocks draft creation",
+  "preexisting foreign draft conflict is never adopted or deleted",
+  "draft creation request has an exact typed API contract",
   "non-ancestor stable Release blocks draft creation",
   "previous annotated Tag drift blocks draft creation",
   "history and assets precede draft creation",
@@ -106,22 +108,27 @@ FAKE_GH = <<~'FAKE_GH_RUBY'
     endpoint = args.find { |arg| arg.start_with?("repos/") }
     releases_endpoint = "repos/#{ENV.fetch('GITHUB_REPOSITORY')}/releases"
     if method == "POST" && endpoint == releases_endpoint
-      fields = []
-      args.each_index do |index|
-        fields << args[index + 1] if ["-f", "-F"].include?(args[index])
-      end
-      expected_fields = [
-        "tag_name=#{ENV.fetch('GITHUB_REF_NAME')}",
-        "target_commitish=#{ENV.fetch('EXPECTED_COMMIT')}",
-        "name=#{ENV.fetch('GITHUB_REF_NAME')}",
-        "body=Agent Studio 官方精选节点包索引 #{ENV.fetch('GITHUB_REF_NAME')}",
-        "draft=true",
-        "prerelease=false",
+      expected_arguments = [
+        "api", "--method", "POST", releases_endpoint,
+        "-H", "X-GitHub-Api-Version: 2026-03-10",
+        "-f", "tag_name=#{ENV.fetch('GITHUB_REF_NAME')}",
+        "-f", "target_commitish=#{ENV.fetch('EXPECTED_COMMIT')}",
+        "-f", "name=#{ENV.fetch('GITHUB_REF_NAME')}",
+        "-f", "body=Agent Studio 官方精选节点包索引 #{ENV.fetch('GITHUB_REF_NAME')}",
+        "-F", "draft=true",
+        "-F", "prerelease=false",
+        "-F", "generate_release_notes=false",
+        "-f", "make_latest=false",
       ]
-      unless fields == expected_fields
-        log("invalid-create-fields:#{fields.join('|')}")
-        warn "invalid draft creation fields"
+      unless args == expected_arguments
+        log("invalid-create-arguments:#{args.join('|')}")
+        warn "invalid exact draft creation request"
         exit 2
+      end
+      if scenario == "preexisting_draft_conflict"
+        log("create-conflict-existing-draft")
+        warn "gh: Validation Failed (HTTP 422)"
+        exit 1
       end
       log("create-validated-id:42")
       set_state("draft")
@@ -437,8 +444,79 @@ def run_case(publish_script, scenario)
   end
 end
 
+def create_request_arguments(environment)
+  [
+    "api", "--method", "POST",
+    "repos/#{environment.fetch('GITHUB_REPOSITORY')}/releases",
+    "-H", "X-GitHub-Api-Version: 2026-03-10",
+    "-f", "tag_name=#{environment.fetch('GITHUB_REF_NAME')}",
+    "-f", "target_commitish=#{environment.fetch('EXPECTED_COMMIT')}",
+    "-f", "name=#{environment.fetch('GITHUB_REF_NAME')}",
+    "-f", "body=Agent Studio 官方精选节点包索引 #{environment.fetch('GITHUB_REF_NAME')}",
+    "-F", "draft=true",
+    "-F", "prerelease=false",
+    "-F", "generate_release_notes=false",
+    "-f", "make_latest=false",
+  ]
+end
+
+def exercise_create_boundary(mutator = nil)
+  Dir.mktmpdir("release-create-contract") do |directory|
+    environment = setup_fixture(directory)
+    environment["FAKE_SCENARIO"] = "success"
+    arguments = create_request_arguments(environment)
+    mutator&.call(arguments, directory)
+    _stdout, stderr, status = Open3.capture3(environment, "gh", *arguments)
+    log = File.file?(environment.fetch("FAKE_CALL_LOG")) ? File.read(environment.fetch("FAKE_CALL_LOG")) : ""
+    state_path = File.join(environment.fetch("FAKE_STATE_DIR"), "state")
+    return [status, stderr, log, File.exist?(state_path)]
+  end
+end
+
 failures = []
 assert = ->(condition, message) { failures << message unless condition }
+
+valid_create_status, valid_create_stderr, valid_create_log, valid_create_state = exercise_create_boundary
+assert.call(valid_create_status.success?, "exact typed draft POST was rejected by the boundary fake: #{valid_create_stderr}")
+assert.call(valid_create_log.include?("gh:create-validated-id:42") && valid_create_state, "exact typed draft POST did not create fake state")
+
+invalid_create_requests = {
+  "raw draft boolean" => lambda do |arguments, _directory|
+    draft_index = arguments.index("draft=true")
+    arguments[draft_index - 1] = "-f"
+  end,
+  "raw generated-notes boolean" => lambda do |arguments, _directory|
+    generated_index = arguments.index("generate_release_notes=false")
+    arguments[generated_index - 1] = "-f"
+  end,
+  "typed make-latest string" => lambda do |arguments, _directory|
+    latest_index = arguments.index("make_latest=false")
+    arguments[latest_index - 1] = "-F"
+  end,
+  "input body" => lambda do |arguments, directory|
+    arguments.concat(["--input", File.join(directory, "payload.json")])
+  end,
+  "query migration" => lambda do |arguments, _directory|
+    endpoint_index = arguments.index { |argument| argument.start_with?("repos/") }
+    arguments[endpoint_index] = "#{arguments.fetch(endpoint_index)}?draft=true"
+  end,
+  "unknown option" => lambda { |arguments, _directory| arguments << "--silent" },
+  "duplicate field" => lambda { |arguments, _directory| arguments.concat(["-F", "draft=true"]) },
+  "changed body field" => lambda do |arguments, _directory|
+    body_index = arguments.index { |argument| argument.start_with?("body=") }
+    arguments[body_index] = "body=unexpected"
+  end,
+  "missing field" => lambda do |arguments, _directory|
+    prerelease_index = arguments.index("prerelease=false")
+    arguments.slice!(prerelease_index - 1, 2)
+  end,
+}
+invalid_create_requests.each do |label, mutator|
+  status, _stderr, log, state_created = exercise_create_boundary(mutator)
+  assert.call(!status.success?, "boundary fake accepted #{label}")
+  assert.call(!state_created, "boundary fake created state for #{label}")
+  assert.call(!log.include?("gh:create-validated-id:"), "boundary fake validated #{label}")
+end
 
 Dir.mktmpdir("release-lib-behavior") do |directory|
   environment = setup_fixture(directory)
@@ -494,6 +572,16 @@ existing = run_case(publish_script, "existing_release")
 assert.call(!existing.status.success?, "existing Release fixture unexpectedly succeeded")
 assert.call(existing.log.include?("gh:current-release:200"), "existing Release was not queried")
 assert.call(!existing.log.include?("gh:create-validated-id:"), "existing Release did not block draft creation")
+
+foreign_draft = run_case(publish_script, "preexisting_draft_conflict")
+assert.call(!foreign_draft.status.success?, "preexisting foreign draft conflict unexpectedly succeeded")
+assert.call(foreign_draft.log.include?("gh:current-release:404"), "foreign draft fixture did not model published by-tag absence")
+assert.call(foreign_draft.log.include?("gh:create-conflict-existing-draft"), "draft POST did not expose the atomic foreign draft conflict")
+assert.call(!foreign_draft.log.include?("gh:create-validated-id:"), "foreign draft was adopted as this run's draft")
+assert.call(!foreign_draft.log.include?("gh:upload:"), "assets were uploaded after a foreign draft conflict")
+assert.call(!foreign_draft.log.include?("gh:edit-validated:"), "foreign draft was promoted")
+assert.call(!foreign_draft.log.include?("gh:get-id:"), "cleanup inspected a foreign draft without an exact captured ID")
+assert.call(!foreign_draft.log.include?("gh:delete-id:"), "cleanup deleted a foreign draft")
 
 newer = run_case(publish_script, "lagged_newer_release")
 assert.call(!newer.status.success?, "newer stable Release fixture unexpectedly succeeded")

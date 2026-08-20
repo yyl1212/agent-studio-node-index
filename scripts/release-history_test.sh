@@ -78,7 +78,14 @@ FAKE_GH = <<~'RUBY_SCRIPT'
   scenario = ENV.fetch("FAKE_SCENARIO")
   if tag == ENV.fetch("GITHUB_REF_NAME")
     if scenario == "existing_current"
-      puts JSON.generate({"id" => 20, "tag_name" => tag, "draft" => true, "prerelease" => false, "published_at" => nil})
+      puts JSON.generate({
+        "id" => 20,
+        "tag_name" => tag,
+        "target_commitish" => ENV.fetch("CURRENT_COMMIT"),
+        "draft" => false,
+        "prerelease" => false,
+        "published_at" => "2026-08-20T00:00:00Z",
+      })
       exit
     end
     warn "gh: Not Found (HTTP 404)"
@@ -92,7 +99,7 @@ FAKE_GH = <<~'RUBY_SCRIPT'
     warn "gh: Not Found (HTTP 404)"
     exit 1
   end
-  if scenario == "malformed_release" && tag == "v0.1.0"
+  if scenario == "missing_published_at" && tag == "v0.1.0"
     puts JSON.generate({
       "id" => 10,
       "tag_name" => tag,
@@ -106,13 +113,20 @@ FAKE_GH = <<~'RUBY_SCRIPT'
   commit = tag == "v0.3.0" ? ENV.fetch("NEWER_COMMIT") : ENV.fetch("PREVIOUS_COMMIT")
   draft = scenario == "draft_history" && tag == "v0.1.0"
   prerelease = scenario == "prerelease_history" && tag == "v0.1.0"
+  published_at = if scenario == "null_published_at" && tag == "v0.1.0"
+                   nil
+                 elsif scenario == "empty_published_at" && tag == "v0.1.0"
+                   ""
+                 else
+                   "2026-08-20T00:00:00Z"
+                 end
   puts JSON.generate({
     "id" => tag == "v0.3.0" ? 30 : 10,
     "tag_name" => tag,
     "target_commitish" => commit,
     "draft" => draft,
     "prerelease" => prerelease,
-    "published_at" => draft ? nil : "2026-08-20T00:00:00Z",
+    "published_at" => published_at,
   })
 RUBY_SCRIPT
 
@@ -168,12 +182,12 @@ check.call(!lag.status.success?, "replication-lag fixture accepted a lower curre
 check.call(lag.log.include?("gh:exact-tag:v0.3.0"), "fresh higher stable Tag was not queried exactly")
 check.call(!lag.log.include?("gh:stale-list"), "lag fixture consulted the stale Release list")
 
-%w[existing_current malformed_release release_error ambiguous_tag too_many_tags].each do |scenario|
+%w[existing_current draft_history missing_published_at null_published_at empty_published_at release_error ambiguous_tag too_many_tags].each do |scenario|
   result = run_case(root, history_script, scenario)
   check.call(!result.status.success?, "#{scenario} fixture did not fail closed")
 end
 
-%w[no_release draft_history prerelease_history].each do |scenario|
+%w[no_release prerelease_history].each do |scenario|
   result = run_case(root, history_script, scenario)
   check.call(result.status.success?, "#{scenario} fixture failed: #{result.stderr}")
   check.call(result.stdout.empty?, "#{scenario} fixture incorrectly counted a published stable Release")

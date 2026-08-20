@@ -19,23 +19,23 @@ release_json=$(mktemp "$RUNNER_TEMP/release-history.XXXXXX.json")
 release_error_output=$(mktemp "$RUNNER_TEMP/release-history.XXXXXX.err")
 trap 'rm -f "$remote_refs" "$candidates" "$published" "$previous" "$release_json" "$release_error_output"' EXIT
 
-assert_current_release_absent() {
+assert_current_published_release_absent() {
   : >"$release_json"
   : >"$release_error_output"
   if gh api \
     "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
     -H "X-GitHub-Api-Version: 2026-03-10" \
     >"$release_json" 2>"$release_error_output"; then
-    release_error "a Release already exists for $GITHUB_REF_NAME"
+    release_error "a published Release already exists for $GITHUB_REF_NAME"
     return 1
   elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_error_output"; then
     cat "$release_error_output" >&2
-    release_error "unable to prove that the current Release does not exist"
+    release_error "unable to prove that the current published Release does not exist"
     return 1
   fi
 }
 
-assert_current_release_absent
+assert_current_published_release_absent
 
 set +e
 git ls-remote --tags origin 'refs/tags/v*' |
@@ -75,14 +75,14 @@ while IFS=$'\t' read -r tag object commit; do
         (.id | type) == "number" and .id > 0 and
         .tag_name == $tag and
         (.target_commitish | type) == "string" and (.target_commitish | length) > 0 and
-        (.draft | type) == "boolean" and
+        .draft == false and
         (.prerelease | type) == "boolean" and
-        ((.published_at | type) == "string" or .published_at == null)
+        (.published_at | type) == "string" and (.published_at | length) > 0
       ' "$release_json" >/dev/null; then
       release_error "malformed exact Release response for $tag"
       exit 1
     fi
-    if jq -e '.draft == false and .prerelease == false and (.published_at | type) == "string" and (.published_at | length) > 0' "$release_json" >/dev/null; then
+    if jq -e '.prerelease == false' "$release_json" >/dev/null; then
       printf '%s\t%s\t%s\n' "$tag" "$object" "$commit" >>"$published"
     fi
   elif ! grep -Eq 'HTTP/[0-9.]+ 404|HTTP 404' "$release_error_output"; then
@@ -97,7 +97,8 @@ done <"$candidates"
   CGO_ENABLED=0 go run ./cmd/releasehistory previous --current "$GITHUB_REF_NAME"
 ) <"$published" >"$previous"
 
-# Repeat the exact current-Tag lookup after all candidate queries so a Release
-# that appeared during history enumeration cannot reach draft creation.
-assert_current_release_absent
+# Repeat the exact current-Tag lookup after all candidate queries so a published
+# Release that appeared during history enumeration cannot reach draft creation.
+# A clean 404 proves only published absence; draft conflicts are closed by POST.
+assert_current_published_release_absent
 cat "$previous"

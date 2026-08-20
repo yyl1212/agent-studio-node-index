@@ -109,6 +109,8 @@ trap 'exit 143' TERM
 bash "$script_dir/release-gate.sh"
 
 cleanup_armed=1
+# Release-by-tag 404 covers published Releases only. This create request is the
+# atomic conflict boundary for an existing draft; never adopt or overwrite it.
 gh api --method POST \
   "repos/$GITHUB_REPOSITORY/releases" \
   -H "X-GitHub-Api-Version: 2026-03-10" \
@@ -118,6 +120,8 @@ gh api --method POST \
   -f body="Agent Studio 官方精选节点包索引 $GITHUB_REF_NAME" \
   -F draft=true \
   -F prerelease=false \
+  -F generate_release_notes=false \
+  -f make_latest=false \
   >"$draft_response"
 draft_id=$(jq -er '.id | select(type == "number" and . > 0)' "$draft_response")
 jq -e \

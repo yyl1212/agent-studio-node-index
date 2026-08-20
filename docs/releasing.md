@@ -8,7 +8,7 @@
 - 新版本是完整 stable SemVer，例如 `v0.1.0`；必须严格大于此前所有完整 stable Release。
 - 上一个完整 Release 的 Tag commit 是当前 commit 的祖先。
 - 仓库已启用 immutable Releases；发布 token 只在 `publish` job 获得 `contents:write`。
-- 当前版本不存在任何 draft、prerelease、stable 或 immutable Release。
+- 当前版本不得存在任何 Release。精确 Release-by-tag 预检只能证明没有已发布 Release，看不到残留 draft；最终由创建 draft 的 POST 原子地拒绝同 Tag 冲突，workflow 不接管、覆盖或删除既有 draft。
 - 从 Tag push 到最终 immutable 核验结束，远端 annotated Tag 对象及其解引用 commit 都不得被移动或删除；workflow 会在 draft 创建前、转正前和最终核验期间重新读取远端 Tag 并失败关闭。
 
 ## 创建 annotated Tag
@@ -50,9 +50,9 @@ publish（contents:write）
 
 所有 Release workflow 共享固定并发组并设置 `queue: max`，后来的 Tag run 不会取消正在发布或等待的 run。该平台队列最多保留 100 个 pending run，不是无限队列；等待项的启动受平台 FIFO 边界约束，但 workflow 不把调度或完成顺序当作版本正确性保证。
 
-`build` 与 `publish` 使用同一个历史门禁；`publish` 会在 draft 创建前再次完整执行。门禁不使用可能有索引复制延迟的 Release list：它在硬 60 秒墙钟内最多读取 200 条远端 `v*` Tag ref，只保留最多 100 个对象和 peeled commit 均唯一的 annotated full stable SemVer Tag，再对每个候选调用固定 API 版本的精确 Release-by-tag endpoint。干净 404 表示该 Tag 没有已发布 Release；仅非 draft、非 prerelease 且存在 `published_at` 的响应计入历史，畸形 JSON、歧义 Tag、非 404 API 错误或超出上限都失败关闭。门禁用真实 Go SemVer 比较得到最高 previous Release，重新解析其 annotated Tag，并在创建 draft 的紧邻阶段验证 previous commit 是当前 commit 的祖先；当前 Tag 的 Release 缺失也在枚举前后精确复核。
+`build` 与 `publish` 使用同一个历史门禁；`publish` 会在 draft 创建前再次完整执行。门禁不使用可能有索引复制延迟的 Release list：它在硬 60 秒墙钟内最多读取 200 条远端 `v*` Tag ref，只保留最多 100 个对象和 peeled commit 均唯一的 annotated full stable SemVer Tag，再对每个候选调用固定 API 版本的精确 Release-by-tag endpoint。干净 404 只表示该 Tag 没有已发布 Release；任何 200 响应都必须明确为 `draft=false`，并带有非空字符串 `published_at`，否则失败关闭；随后仅 `prerelease=false` 的已发布响应计入 stable 历史。畸形 JSON、歧义 Tag、非 404 API 错误或超出上限同样失败关闭。门禁用真实 Go SemVer 比较得到最高 previous Release，重新解析其 annotated Tag，并在创建 draft 的紧邻阶段验证 previous commit 是当前 commit 的祖先；当前 Tag 的“没有已发布 Release”也在枚举前后精确复核。
 
-`publish` 在所有只读验证完成前不会创建 Release。draft 只能上传 `checksums.txt`、`index.json` 和 `node-index-v1alpha1.schema.json`。创建响应中的精确 Release ID 会被保留到整个 publish 状态机结束；失败或取消时，只在该 ID 仍是同 Tag、同 target commit、非 immutable draft 且远端 Tag 仍未漂移时才删除，绝不按模糊 Tag 删除，也绝不删除已发布 Release。转正前会回下载三者并逐字节比较；转正后必须在覆盖整个 poll 的硬 60 秒墙钟内观察到字面元组 `false false true <当前 Tag>`，并从每轮唯一一次 Release API 响应验证 ID、target 和三个 `sha256:` digest。
+`publish` 在所有只读验证完成前不会创建 Release。创建 POST 显式提交 Tag、target、名称和正文，并以布尔字段指定 `draft=true`、`prerelease=false`、`generate_release_notes=false`，同时指定 `make_latest=false`；它也是无法通过 Release-by-tag 预检观察到的残留 draft 的原子冲突边界。POST 冲突会在记录 ID 或上传前终止，workflow 不采用该 Release，也不会对它执行查询、编辑或清理。新建 draft 只能上传 `checksums.txt`、`index.json` 和 `node-index-v1alpha1.schema.json`。创建响应中的精确 Release ID 会被保留到整个 publish 状态机结束；失败或取消时，只在该 ID 仍是同 Tag、同 target commit、非 immutable draft 且远端 Tag 仍未漂移时才删除，绝不按模糊 Tag 删除，也绝不删除已发布 Release。转正前会回下载三者并逐字节比较；转正后必须在覆盖整个 poll 的硬 60 秒墙钟内观察到字面元组 `false false true <当前 Tag>`，并从每轮唯一一次 Release API 响应验证 ID、target 和三个 `sha256:` digest。
 
 ## 发布后核验
 
@@ -72,7 +72,7 @@ find "$download_dir" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort
 
 ## 失败处理
 
-- 在 draft 创建前失败：修复代码后发布更高版本；不要移动已推送的 Tag。
+- 在 draft 创建前失败：修复代码后发布更高版本；不要移动已推送的 Tag。若创建 POST 因同 Tag 既有 draft 冲突，日志不会有本次运行捕获的 Release ID，也不会上传、编辑或删除该既有 draft；保留现场并按精确 ID 人工核对，禁止模糊删除。
 - draft 创建后、转正前失败或取消：workflow 会记录精确 Release ID，输出清理诊断，并仅在安全条件仍成立时自动删除该 draft。若日志显示因 ID、状态、target 或远端 Tag 不匹配而拒绝清理，保留现场并人工核对精确 ID；不要按 Tag 模糊删除，也不要清理、移动或重新推送 Tag。
 - 转正后任何核验失败：把 Release 视为不可修改的事故证据，停止消费并发布更高修复版本。不可覆盖资产、改写 Tag 或复用版本号。
 
